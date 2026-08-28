@@ -42,18 +42,29 @@ def test_combined_scenario_survives_loop_detection_and_validation_together():
 
 
 def test_budget_is_still_the_ultimate_backstop_even_with_all_layers_enabled():
-    # runaway 场景：50 步完全相同的调用。循环检测会在第 5 步就命中，
-    # 但即使假设某一层防护失灵，预算也必须是兜底：调用次数不会超过 max_steps。
-    goal, script = get_scenario("runaway")
+    # 20 次合法的 search_web 调用，每次参数都不同（不会触发循环检测的"连续 5 次
+    # 相同调用"判定），且工具本身一定会成功（不会触发校验失败）——这样如果预算这道
+    # 最后防线失灵，没有任何其它防护层能把它拦下来，是真正意义上的"兜底"测试。
+    script = [
+        {
+            "content": None,
+            "tool_calls": [
+                {"id": f"call_{i}", "name": "search_web", "args": {"query": f"q_{i}"}}
+            ],
+        }
+        for i in range(20)
+    ]
+    goal = "goal"
     llm = MockLLM(script)
     budget = Budget(max_steps=10)
     registry = build_default_tool_registry()
 
-    run_agent(
+    result = run_agent(
         goal, registry, llm, budget, DEFAULT_COMPACT_CONFIG, DEFAULT_COMPRESSION_CONFIG
     )
 
-    assert llm.call_count <= 10
+    assert "步骤上限已达" in result
+    assert llm.call_count == 10
 
 
 def test_all_five_layers_are_present_in_a_single_run_agent_call():

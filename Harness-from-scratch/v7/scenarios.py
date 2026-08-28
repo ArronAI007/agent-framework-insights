@@ -123,7 +123,7 @@ SCENARIOS = {
         ],
     ),
     # 综合场景：先触发循环检测（5 次调用同一坏工具被禁用），
-    # 紧接着模型犯了一次校验错误（漏填参数）又自己纠正，
+    # 紧接着模型犯了一次校验错误（调用了一个不存在的工具）又自己纠正，
     # 最后正常完成——验证循环检测和输出校验在同一个 run 里不冲突。
     "combined_recovery": (
         "读取 bad.txt，失败就换个办法，然后总结配置文件",
@@ -137,11 +137,11 @@ SCENARIOS = {
         ]
         * 5
         + [
-            # read_file 已被循环检测禁用；改用 write_file 但漏填 content。
+            # read_file 已被循环检测禁用；模型调用了一个不存在的工具 append_note。
             {
                 "content": None,
                 "tool_calls": [
-                    {"id": "c6", "name": "write_file", "args": {"path": "note.txt"}}
+                    {"id": "c6", "name": "append_note", "args": {"path": "note.txt"}}
                 ],
             },
             # 校验失败回填后，模型补全参数重试。
