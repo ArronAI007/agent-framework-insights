@@ -83,7 +83,7 @@ SCENARIOS = {
             {
                 "content": None,
                 "tool_calls": [
-                    {"id": f"call_{i}", "name": "search_web", "args": {"query": "big"}}
+                    {"id": f"call_{i}", "name": "search_web", "args": {"query": f"big_{i}"}}
                 ],
             }
             for i in range(10)
