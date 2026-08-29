@@ -1,6 +1,6 @@
 # Agent Framework Insights
 
-> 两套面向"彻底剖析"的中文技术课程,分别系统性拆解两个真实开源 Agent Harness 项目的架构：先会用，再懂原理，最后能扩展。每篇文章都摘录真实源码并逐段讲解设计动机，而不是停留在使用文档层面。
+> 三套面向"彻底剖析"的中文技术课程,分别系统性拆解三个真实开源 Agent Harness 项目的架构：先会用，再懂原理，最后能扩展。每篇文章都摘录真实源码并逐段讲解设计动机，而不是停留在使用文档层面。
 
 ## 课程一：PI（[earendil-works/pi](https://github.com/earendil-works/pi)）
 
@@ -46,18 +46,44 @@ DeepSeek AI 开源的 agent harness：整个运行时构建在 Cordis 这个"万
 
 </details>
 
-## 两个项目的架构哲学速览
+## 课程三：Hermes Agent（[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)）
 
-| | PI | DeepSeek Harness |
-|---|---|---|
-| 扩展方式 | 精简核心 + TypeScript Extension / Skills / Prompt 模板 | 万物皆插件（Cordis），能力按 Service Definition / Provider / Tool 三元结构组织 |
-| 框架依赖 | 无独立元框架，扩展机制内建于 `coding-agent` 包 | 依赖 vendor 进仓库的 Cordis 生态（源码自持，可审计可打补丁） |
-| 多模型层 | `pi-ai` 统一接口 | `packages/llm/*` seam + `llm-deepseek`/`llm-pi-ai` 双 Provider 对照验证 |
-| 会话表示 | JSONL append 日志 | 事件溯源日志（`SessionEventMap`）+ Surface 投影，压缩靠 `replace` 而非删除 |
-| 沙箱 | 依赖外部容器化 | 自建多平台沙箱（bwrap / Seatbelt / 纯 C 手写 Landlock / Windows ACL）+ E2B 远程 |
-| 部署/进程形态 | 单一 CLI 进程 | Host（Node）/ Client（浏览器）类型与构建物理分离，Typert 编译期生成 RPC 契约 |
+一个自我进化的个人/团队 Agent：会从经验里创建并在使用中改进 Skill、支持多种可插拔终端后端（本地/Docker/SSH/Singularity/Modal/Daytona/Vercel Sandbox）、内置 cron 调度与消息网关（Telegram/Discord/Slack/WhatsApp/Signal/Email 共用一个进程）。规模远超前两个项目——核心文件普遍是万行级的 Python 模块，是一个经过大量真实生产故障打磨出来的系统，工程气质与 PI/DeepSeek-Harness 的"干净架构展示"截然不同。
 
-建议先学完其中一套课程建立整体直觉，再对照阅读另一套——两个项目解决的是同一类问题，几乎处处做出了不同的架构选择，对照阅读收获会比单读一套更大。
+👉 从 [Hermes-Agent/00-课程导读/README.md](Hermes-Agent/00-课程导读/README.md) 开始。
+
+<details>
+<summary>展开完整目录（40 篇）</summary>
+
+- **00-课程导读**：[README](Hermes-Agent/00-课程导读/README.md)
+- **01-快速上手**：[安装与环境准备](Hermes-Agent/01-快速上手/01-安装与环境准备.md) · [快速开始：CLI 与 Gateway 速览](Hermes-Agent/01-快速上手/02-快速开始-CLI与Gateway速览.md) · [CLI 命令与 Slash 命令体系](Hermes-Agent/01-快速上手/03-CLI命令与Slash命令体系.md) · [Provider 与模型配置](Hermes-Agent/01-快速上手/04-Provider与模型配置.md) · [Profile 与个性化配置](Hermes-Agent/01-快速上手/05-Profile与个性化配置.md)
+- **02-仓库全景与工程实践**：[顶层结构地图与技术栈全景](Hermes-Agent/02-仓库全景与工程实践/01-顶层结构地图与技术栈全景.md) · [Monorepo 依赖管理与构建测试流程](Hermes-Agent/02-仓库全景与工程实践/02-Monorepo依赖管理与构建测试流程.md) · [CI/CD 与供应链安全](Hermes-Agent/02-仓库全景与工程实践/03-CI-CD与供应链安全.md) · [Footprint Ladder：能力分层哲学](Hermes-Agent/02-仓库全景与工程实践/04-Footprint-Ladder能力分层哲学.md)
+- **03-Agent 核心循环**：[AIAgent 总览与运行时架构](Hermes-Agent/03-Agent核心循环/01-AIAgent总览与运行时架构.md) · [turn_context 前奏与轮内状态机](Hermes-Agent/03-Agent核心循环/02-turn_context前奏与轮内状态机.md) · [错误分类、降级与重试机制](Hermes-Agent/03-Agent核心循环/03-错误分类降级与重试机制.md) · [中断与轮内改口 Steering](Hermes-Agent/03-Agent核心循环/04-中断与轮内改口Steering.md)
+- **04-多 Provider 与工具系统**：[Provider Profile 注册表与原生 Adapter 双轨制](Hermes-Agent/04-多Provider与工具系统/01-Provider-Profile注册表与原生Adapter双轨制.md) · [工具自注册管线与 Schema](Hermes-Agent/04-多Provider与工具系统/02-工具自注册管线与Schema.md) · [Toolsets 组合与分发](Hermes-Agent/04-多Provider与工具系统/03-Toolsets组合与分发.md) · [Session vs Process 能力门控设计精讲](Hermes-Agent/04-多Provider与工具系统/04-Session-vs-Process能力门控设计精讲.md)
+- **05-终端后端与执行安全**：[终端环境抽象与七种后端实现](Hermes-Agent/05-终端后端与执行安全/01-终端环境抽象与七种后端实现.md) · [Programmatic Tool Calling：本地 UDS 与远程文件轮询 RPC](Hermes-Agent/05-终端后端与执行安全/02-Programmatic-Tool-Calling本地UDS与远程RPC.md) · [批准模式、网络出口隔离与安全模型三层防御](Hermes-Agent/05-终端后端与执行安全/03-批准模式网络出口隔离与安全模型三层防御.md)
+- **06-记忆状态与压缩**：[SessionDB Mixin 架构：SQLite WAL、FTS5 与 CJK 分词](Hermes-Agent/06-记忆状态与压缩/01-SessionDB-Mixin架构-SQLite-WAL-FTS5与CJK分词.md) · [上下文压缩：运行时策略与迭代式摘要更新](Hermes-Agent/06-记忆状态与压缩/02-上下文压缩-运行时策略与迭代式摘要更新.md) · [面向训练数据的独立压缩器 Trajectory Compressor](Hermes-Agent/06-记忆状态与压缩/03-面向训练数据的独立压缩器Trajectory-Compressor.md)
+- **07-Skills 自我进化学习环**：[Learn 命令：从对话到 SKILL.md 的生成机制](Hermes-Agent/07-Skills自我进化学习环/01-Learn命令-从对话到SKILL-md的生成机制.md) · [知识库布局与 SKILL 写作规范](Hermes-Agent/07-Skills自我进化学习环/02-知识库布局与SKILL写作规范.md) · [Curator：后台复审与技能生命周期治理](Hermes-Agent/07-Skills自我进化学习环/03-Curator后台复审与技能生命周期治理.md)
+- **08-插件系统与协议生态**：[PluginContext 与四种发现源](Hermes-Agent/08-插件系统与协议生态/01-PluginContext与四种发现源.md) · [插件架构对比精讲：Hermes vs Pi vs OpenCode](Hermes-Agent/08-插件系统与协议生态/02-插件架构对比精讲-Hermes-vs-Pi-vs-OpenCode.md) · [MCP 双向集成：作为 Client 与作为 Server](Hermes-Agent/08-插件系统与协议生态/03-MCP双向集成-作为Client与作为Server.md) · [ACP 适配器：接入 Zed 等标准 Agent Host](Hermes-Agent/08-插件系统与协议生态/04-ACP适配器-接入Zed等标准Agent-Host.md)
+- **09-多智能体网关与调度**：[delegate_task 轻量子代理委派](Hermes-Agent/09-多智能体网关与调度/01-delegate_task轻量子代理委派.md) · [Kanban 任务看板与 Swarm 编排](Hermes-Agent/09-多智能体网关与调度/02-Kanban任务看板与Swarm编排.md) · [消息网关平台注册表：一进程多平台](Hermes-Agent/09-多智能体网关与调度/03-消息网关平台注册表-一进程多平台.md) · [Cron 调度：本地 Tick 与 Chronos 托管无服务器化](Hermes-Agent/09-多智能体网关与调度/04-Cron调度-本地Tick与Chronos托管无服务器化.md)
+- **10-界面层与前端协议**：[四种前端与共享 JSON-RPC 网关协议](Hermes-Agent/10-界面层与前端协议/01-四种前端与共享JSON-RPC网关协议.md)
+- **11-测试评估与研究工具**：[测试哲学：不测变更检测器](Hermes-Agent/11-测试评估与研究工具/01-测试哲学-不测变更检测器.md) · [Evals 框架：面向子系统能力的自建评测](Hermes-Agent/11-测试评估与研究工具/02-Evals框架-面向子系统能力的自建评测.md) · [Batch Runner 与训练轨迹生成](Hermes-Agent/11-测试评估与研究工具/03-Batch-Runner与训练轨迹生成.md)
+- **12-总结与延伸阅读**：[课程总结与三方对比](Hermes-Agent/12-总结与延伸阅读/01-课程总结与三方对比.md)
+
+</details>
+
+## 三个项目的架构哲学速览
+
+| | PI | DeepSeek Harness | Hermes Agent |
+|---|---|---|---|
+| 扩展方式 | 精简核心 + TypeScript Extension / Skills / Prompt 模板 | 万物皆插件（Cordis），能力按 Service Definition / Provider / Tool 三元结构组织 | 文件目录 + manifest + 单一巨型 `PluginContext`；另有 Footprint Ladder 六级决策框架指导扩展面选型 |
+| 框架依赖 | 无独立元框架，扩展机制内建于 `coding-agent` 包 | 依赖 vendor 进仓库的 Cordis 生态（源码自持，可审计可打补丁） | 无独立元框架，插件发现内建于 `hermes_cli/plugins.py` |
+| 多模型层 | `pi-ai` 统一接口 | `packages/llm/*` seam + `llm-deepseek`/`llm-pi-ai` 双 Provider 对照验证 | `providers/` Profile 元数据（多数 provider）+ 少数原生 Adapter（Anthropic/Bedrock/Gemini/Codex）混合路线 |
+| 会话表示 | JSONL append 日志 | 事件溯源日志（`SessionEventMap`）+ Surface 投影，压缩靠 `replace` 而非删除 | SQLite（WAL + FTS5 + 自研 CJK 分词），mixin 拆分 search/schema/portability，`parent_session_id` 链支撑压缩拆分 |
+| 沙箱 | 依赖外部容器化 | 自建多平台沙箱（bwrap / Seatbelt / 纯 C 手写 Landlock / Windows ACL）+ E2B 远程 | 七种可插拔终端后端（local/docker/ssh/singularity/modal/daytona/vercel）+ 批准模式（启发式）+ 网络出口隔离（OS 级） |
+| 部署/进程形态 | 单一 CLI 进程 | Host（Node）/ Client（浏览器）类型与构建物理分离，Typert 编译期生成 RPC 契约 | 单进程多平台 Gateway，四种前端（classic CLI / Ink TUI / Dashboard 内嵌 PTY / Electron）共享同一套 JSON-RPC 协议 |
+| 独有卖点 | 核心足够小，可作为引擎单独复用 | 自研沙箱内核 + 编译期生成 RPC 契约 | Skills 自我进化学习环（`/learn` + curator）+ Chronos 托管无服务器化 cron + 面向训练数据的 batch_runner |
+
+建议按 PI → DeepSeek Harness → Hermes Agent 的顺序阅读（复杂度递增）——三个项目解决的是同一类问题，几乎处处做出了不同的架构选择，对照阅读收获会比单读一套更大。第 08 章第 2 篇（[插件架构对比精讲](Hermes-Agent/08-插件系统与协议生态/02-插件架构对比精讲-Hermes-vs-Pi-vs-OpenCode.md)）更是直接改写自 Hermes 团队对 Pi 插件架构的源码级评审，读完 PI 课程再读这一篇会有额外收获。
 
 ---
 
