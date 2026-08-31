@@ -161,3 +161,46 @@ v1~v7 分批交付原则的第一批延续：v8（结构化错误处理与重试
 
 - v10 标题虽然是"并发与流式"，但本批次刻意把"流式"限定为不实现（详见上方 v10 小节的说明），只做并发工具调用与超时取消。这是与用户确认过的范围收敛，不是实现中途的缩水。
 - v8~v11 延续 v1~v7"完全自包含、不跨版本 import"的原则；v8/v9 每个版本仍是同步代码，v10 起才引入 `asyncio`，形成第二条"架构基线"，v11~v15 都会建立在 v10 引入的 async 循环之上。
+
+## 实现记录：v12~v15 详细技术方案（第二批工业级扩展，系列收官）
+
+v8~v11 分批交付原则的第二批、也是最后一批：v12（可观测性与成本核算）、v13（自动化评估框架）、v14（动态工具/技能插件化）、v15（多智能体协作）。全部建立在 v11 的 async 权限沙箱骨架之上，延续同一套"自包含、MockLLM 脚本化、记账+判断式防护对象、依赖注入保证确定性可测试"的模式。
+
+### v12：可观测性与成本核算
+
+- 新增 `harness/observability.py`：
+  - `estimate_tokens(text)`：`max(1, len(text) // 4)`（`text` 为空返回 `0`），延续 v5 `needs_compression` 的字符数估算思路，不引入真实 tokenizer 依赖。
+  - `EventLog`：把结构化事件（LLM 调用、工具调用、各类防护触发）追加写入 JSONL，格式与 v9 的 `session_store` 类似但记录的是运行时指标而非对话历史；每条事件带 `step`、`event_type`、以及事件特定字段（如 `tool_name`、`tokens_in`、`tokens_out`、`duration_ms`）。耗时通过注入的 `clock_fn` 参数（默认 `time.perf_counter`）获取，测试传入一个确定性的假时钟（每次调用返回递增的固定值），避免真实计时导致的不确定性。
+  - `compute_cost(tokens_in, tokens_out, rates)`：`rates` 是 `{"input_per_1k": float, "output_per_1k": float}`，返回 `tokens_in/1000*rates["input_per_1k"] + tokens_out/1000*rates["output_per_1k"]`。
+  - `RunReport`：从一个 `EventLog` 的事件列表汇总出总步数、LLM 调用次数、工具调用次数（按成功/失败分类）、总 token 数、总成本、各类防护（循环检测/校验失败/熔断/压缩/权限拒绝）触发次数。
+- `harness/loop.py`：`run_agent()` 新增可选 `event_log` 参数（默认 `None`），为 `None` 时完全不记录、行为与 v11 一致；传入时在 LLM 调用和每次工具执行结束后记一条事件。
+- `main.py` 新增 `--report-file` 参数：跑完后把 `RunReport` 的汇总结果写成 JSON 文件并打印到终端。
+- 测试：验证 `estimate_tokens`/`compute_cost` 的纯函数正确性；验证一个跑完整场景后 `EventLog` 记录的事件数量、类型与该场景已知的调用次数吻合；验证 `RunReport` 汇总的数字正确。
+
+### v13：自动化评估框架
+
+- 新增 `harness/eval_runner.py`：
+  - `run_eval_case(case, tool_registry_factory, ...)`：`case` 是一个字典，`{"scenario": "<已有 scenario 名字>", "expected_result_contains": str, "max_llm_calls": int}`；内部用 `get_scenario` 取出脚本、跑一遍 `run_agent()`，和期望值比对，返回 `{"name": ..., "passed": bool, "actual_result": ..., "actual_call_count": ...}`。
+  - `run_eval_suite(cases)`：批量跑所有用例，汇总通过率、平均 LLM 调用次数、平均 token 数（复用 v12 的 `estimate_tokens`，对每个用例的最终 `result` 字符串估算）。
+  - `compare_to_baseline(current_report, baseline_report)`：和一份存进仓库的 baseline JSON 对比，通过率下降或平均调用次数超出容差就标记为回归。
+- 新增 `evals.py`：eval 用例列表，直接引用 `scenarios.py` 里已有的 scenario（不新增独立的场景数据格式），如 `happy_path`、`circuit_breaker_trips`、`deny_dangerous_tool` 等各自搭配期望断言。
+- `main.py` 新增 `--run-evals` 模式：跑一遍 eval 套件并打印/落盘汇总报告。
+- 测试：验证单个 eval 用例通过/不通过两种情况都能被正确判定；验证套件汇总的通过率/平均值计算正确；验证 `compare_to_baseline` 能正确识别一次"变差了"的对比。
+
+### v14：动态工具/技能插件化
+
+- 新增 `harness/tool_registry.py`：`class ToolRegistry(dict)`，新增 `register(tool)`（`self[tool.name] = tool`）和 `unregister(name)`（`self.pop(name, None)`），不覆写任何 dict 原生方法——`registry[name]`、`del registry[name]`、`name in registry`、`.keys()` 等现有调用方式在 `harness/loop.py`、`harness/validator.py`、`harness/permissions.py` 里全部不需要改动。
+- `tools.py`：`build_default_tool_registry()` 返回 `ToolRegistry` 实例而不是普通 `dict`；新增 `load_plugin(plugin_name)` 工具，闭包持有对 registry 自身的引用，调用后把一个预先定义好、但默认不在注册表里的工具（`weather_lookup`）动态 `register()` 进去。
+- 场景：模型第一轮调用 `load_plugin("weather")` 完成注册；第二轮调用 `weather_lookup(...)`，直接通过 v6 的 `validate_tool_call` 和 v11 的 `check_permission`（两者都只是运行时查一次 registry/policy，没有任何需要因为"新工具"而改动的硬编码逻辑）并成功执行——证明动态注册的工具能"零改动自动适配"已有的校验与权限层。
+- 测试：验证 `load_plugin` 执行前调用 `weather_lookup` 会被校验拦截（"未知工具"）；执行 `load_plugin` 后 `weather_lookup` 出现在 registry 里且可以被正常调用；验证 `ToolRegistry` 的 `register`/`unregister` 方法本身的正确性。
+
+### v15：多智能体协作
+
+- `tools.py` 新增 `delegate_task(subtask)` 工具：`build_default_tool_registry()` 新增可选参数 `sub_task_scripts`（默认 `None`），类型是 `{subtask_name: (sub_goal, sub_script)}`。`delegate_task` 闭包按 `subtask` 查表，取出对应的 `sub_goal`/`sub_script`，构建一个全新的子 `MockLLM(sub_script)`、子 `Budget(max_steps=...)`、子 `tool_registry`（调用 `build_default_tool_registry()`，不传 `sub_task_scripts`，故意不支持嵌套委派，避免无限递归复杂度），递归 `await` 调用同一个 `harness.loop.run_agent()`，把子任务的最终结果字符串包装成 `f"[子任务：{subtask} 完成] {result}"` 作为这次工具调用的返回值——自然回填进主循环的 `messages`，不需要任何特殊的"多智能体消息类型"。
+- 主 agent 与子 agent 各自拥有独立的 `messages`、`Budget`、`llm.call_count`，互不干扰；子 agent 的 `MockLLM` 是一个完全独立的实例，其调用次数不计入主循环的 `llm.call_count`。
+- 场景：主循环某一轮委派一个子任务（如"调研某个子问题"），子 agent 跑 2 轮后返回摘要，主循环收到摘要后再跑一轮完成整体任务。
+- 测试：验证委派场景的最终结果、主 `llm.call_count`（只反映主循环轮次）；验证子任务脚本用尽或子任务本身触发某种防护（如子任务内部校验失败）时，子 agent 依然能返回一个说明性的结果字符串给主循环，而不是让异常直接扎穿委派边界导致主循环崩溃（`delegate_task` 内部需要捕获子 `run_agent()` 可能抛出的 `ScriptExhausted`，转换成一条说明性的失败摘要返回给主循环，而不是让主循环也跟着崩溃）。
+
+### v12~v15 收尾
+
+v15 完成后不再新增一个类似 v7 那样的"大集成"场景——v7 已经是 v1~v7 阶段的里程碑，v12~v15 每个版本本身就是独立的能力域（可观测性、评估、动态工具、多智能体），互相之间没有 v2~v6 那种"五层防护必须协同工作"的强耦合关系，额外做一次大集成场景的教学价值有限、且会显著增加范围。最后一个任务只做：① 根目录 `README.md` 的路线图表格补完 v12~v15 四行链接，标注整个 v1~v15 系列完成；② v1~v15 全部版本目录跑一遍测试套件做最终回归确认。
