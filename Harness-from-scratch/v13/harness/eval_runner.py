@@ -14,9 +14,18 @@ async def run_eval_case(case, compact_config, compression_config):
     budget = Budget(max_steps=case.get("max_steps", 30))
     registry = build_default_tool_registry()
 
-    result = await run_agent(
-        goal, registry, llm, budget, compact_config, compression_config
-    )
+    try:
+        result = await run_agent(
+            goal, registry, llm, budget, compact_config, compression_config
+        )
+    except Exception as exc:  # noqa: BLE001 - 单个用例异常应记为失败，不能拖垮整批评估
+        return {
+            "name": case["scenario"],
+            "passed": False,
+            "actual_result": f"Error: {exc}",
+            "actual_call_count": llm.call_count,
+            "estimated_tokens": 0,
+        }
 
     passed = True
     if "expected_result_contains" in case and case["expected_result_contains"] not in result:
@@ -56,6 +65,10 @@ async def run_eval_suite(cases, compact_config, compression_config):
 
 
 def compare_to_baseline(current_report, baseline_report, call_tolerance=1.0):
+    for key in ("pass_rate", "avg_llm_calls"):
+        if key not in baseline_report:
+            raise ValueError(f"baseline_report 缺少必需字段：{key}")
+
     regressions = []
     if current_report["pass_rate"] < baseline_report["pass_rate"]:
         regressions.append(

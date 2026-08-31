@@ -27,4 +27,6 @@ python3 main.py --run-evals   # 跑一遍离线 eval 套件，打印通过率和
 
 ## 局限性
 
-`evals.py` 里的用例都是手写的、针对现有场景的断言，没有自动发现"哪些场景应该被纳入 eval 套件"的机制——加一个新场景后需要有人手动决定要不要把它加进 `EVAL_CASES`。`compare_to_baseline` 需要调用方自己准备一份 baseline 报告（本版本没有提供"自动保存/更新 baseline 文件"的 CLI 命令），这是刻意保持最小化的简化，真实系统通常会把 baseline 存成一个受版本控制的文件、在 CI 里自动比对。
+`evals.py` 里的用例都是手写的、针对现有场景的断言，没有自动发现"哪些场景应该被纳入 eval 套件"的机制——加一个新场景后需要有人手动决定要不要把它加进 `EVAL_CASES`。`compare_to_baseline` 需要调用方自己准备一份 baseline 报告（本版本没有提供"自动保存/更新 baseline 文件"的 CLI 命令），这是刻意保持最小化的简化，真实系统通常会把 baseline 存成一个受版本控制的文件、在 CI 里自动比对；如果手写的 baseline 缺少必需字段（`pass_rate`、`avg_llm_calls`），`compare_to_baseline` 会直接抛出带字段名的 `ValueError`，而不是留一个不知所云的 `KeyError`。
+
+`run_eval_case` 会捕获 `run_agent()` 抛出的任何异常并把它折算成一条 `passed: False` 的结果（附带异常信息），这样 `EVAL_CASES` 里某一条用例意外出错（比如后续有人加了一个还没跑通的场景）不会让整批评估直接崩溃、丢掉其它已经跑完的用例结果。

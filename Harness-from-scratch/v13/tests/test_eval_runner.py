@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncio
 
+import harness.eval_runner as eval_runner_module
 from evals import EVAL_CASES
 from harness.eval_runner import (
     aggregate_results,
@@ -36,6 +37,16 @@ def test_aggregate_results_computes_pass_rate_and_averages():
     assert report["total_count"] == 2
     assert report["avg_llm_calls"] == 4.0
     assert report["avg_tokens"] == 6.0
+
+
+def test_compare_to_baseline_raises_when_baseline_missing_required_field():
+    baseline = {"pass_rate": 1.0}
+    current = {"pass_rate": 1.0, "avg_llm_calls": 3.0}
+    try:
+        compare_to_baseline(current, baseline)
+        assert False, "应该抛出 ValueError"
+    except ValueError as exc:
+        assert "avg_llm_calls" in str(exc)
 
 
 def test_compare_to_baseline_flags_pass_rate_drop():
@@ -89,6 +100,21 @@ def test_run_eval_case_fails_when_call_count_exceeds_max():
         case = {"scenario": "happy_path", "max_llm_calls": 1}
         result = await run_eval_case(case, DEFAULT_COMPACT_CONFIG, DEFAULT_COMPRESSION_CONFIG)
         assert result["passed"] is False
+
+    asyncio.run(body())
+
+
+def test_run_eval_case_returns_failed_result_instead_of_raising(monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("模拟运行时异常")
+
+    monkeypatch.setattr(eval_runner_module, "run_agent", boom)
+
+    async def body():
+        case = {"scenario": "happy_path"}
+        result = await run_eval_case(case, DEFAULT_COMPACT_CONFIG, DEFAULT_COMPRESSION_CONFIG)
+        assert result["passed"] is False
+        assert "模拟运行时异常" in result["actual_result"]
 
     asyncio.run(body())
 
