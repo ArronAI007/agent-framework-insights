@@ -41,7 +41,8 @@ def build_run_report(events, rates=None):
 
     guardrail_counts = {}
     for e in guardrail_events:
-        guardrail_counts[e["name"]] = guardrail_counts.get(e["name"], 0) + 1
+        name = e.get("name", "unknown")
+        guardrail_counts[name] = guardrail_counts.get(name, 0) + 1
 
     return {
         "llm_call_count": len(llm_calls),

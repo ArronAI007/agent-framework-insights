@@ -30,3 +30,5 @@ python3 main.py --scenario spin_then_recover --report-file /tmp/report.json   # 
 ## 局限性
 
 `estimate_tokens` 只是字符数除以 4 的粗略估算，中英文混合文本下这个比例并不准确，只用于演示"怎么组织成本核算数据"这件事本身。`build_run_report` 需要拿到一个已经跑完的 `EventLog.events` 列表才能汇总，本版本没有提供"运行中途实时查看报告"的能力（只能等 `run_agent()` 返回之后再汇总）。这两点都不影响 v13 要基于本版本的 `estimate_tokens` 构建的评估框架。
+
+另外，事件日志目前不是"运行终止原因"的完整记录：预算耗尽（`budget.is_exceeded()`）和压缩配额耗尽（`compression_guard.is_exhausted()`）这两条早退路径直接 `return`，不会记一条事件，所以报告里看不到"为什么在这一步停下来了"——只有真正发生过的守护动作（比如某次压缩、某次熔断）才会出现在 `guardrail_counts` 里。读报告时不要把"该守护类型未出现在 guardrail_counts 里"当成"这个守护从未生效过"的证据。
