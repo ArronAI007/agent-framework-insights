@@ -121,3 +121,43 @@ v1~v7（基础加固线）已实现完成，过程中对本文档做了两处刻
 - **`scenarios/` 目录简化为单个 `scenarios.py` 文件**：每个版本的场景数量少（2~7 个），拆成目录反而增加跳转成本，单文件里一个 `SCENARIOS` 字典足够清晰，与"版本自包含、易于对比 diff"的核心原则更契合。
 
 这两处简化不影响 v1~v7 的教学目标（五层防护机制本身），已实现的 40 个测试全部通过，7 个版本的 CLI demo 全部可运行。
+
+## 实现记录：v8~v11 详细技术方案（第一批工业级扩展）
+
+v1~v7 分批交付原则的第一批延续：v8（结构化错误处理与重试退避）、v9（会话持久化与断点续跑）、v10（并发与流式）、v11（安全权限沙箱）。整体架构基线：v8/v9 保持同步、延续 v1~v7 风格；v10 起 `run_agent` 转为 `async def`，v11 建在 v10 之上。所有新增的"人工/外部干预点"（重试等待、权限审批）都通过依赖注入的可替换函数暴露给 `run_agent`，保持确定性可测试——这是贯穿这四个版本的统一模式，也是对 v1~v7 里 `Budget`/`CompressionGuard`"记账+判断"设计模式的延续。
+
+### v8：结构化错误处理与重试退避
+
+- 新增 `harness/errors.py`：`TransientError` 异常类（表示可重试的临时故障）+ `classify_error(exc)`（区分 `"retryable"` / `"non_retryable"`，默认非 `TransientError` 都判定为不可重试）。
+- 新增 `harness/retry.py`：`compute_backoff_delay(attempt, base_delay)`（指数退避，`base_delay * 2**attempt`）+ `ToolCircuitBreaker` 类（按工具名分别记录连续失败次数，达到 `failure_threshold` 后判定该工具"熔断"，`is_tripped(tool_name)` 供调用方在执行前查询）。
+- `tools.py` 新增 `flaky_api(query)` 工具：内部维护一个尝试次数计数器，前 N 次调用抛 `TransientError`，第 N+1 次成功——用于确定性地复现"临时故障+重试后成功"。
+- `harness/loop.py`：`run_agent()` 新增 `sleep_fn` 参数（默认 `time.sleep`），执行工具调用时改为一个内部重试循环：捕获异常后用 `classify_error` 判断，`retryable` 且未超过最大重试次数就调用 `sleep_fn(compute_backoff_delay(attempt))` 后重试，否则按失败处理并让 `ToolCircuitBreaker` 记一次失败；执行前先查 `ToolCircuitBreaker.is_tripped`，命中就直接拦截，不消耗一次真实调用。
+- 测试用注入的假 `sleep_fn`（记录被调用的延迟值到一个列表，不真的睡眠）断言退避延迟序列计算正确、重试确实发生了预期次数；`FileNotFoundError`（非 `TransientError`）验证不触发任何重试；一直失败的工具验证熔断在阈值处生效、之后的调用被直接拦截（不再产生新的失败记录）。
+
+### v9：会话持久化与断点续跑
+
+- 新增 `harness/session_store.py`：`append_message(session_path, message)`（JSONL 追加写入一条消息）、`load_session(session_path)`（不存在或为空则返回空列表，否则按行解析）。
+- `harness/loop.py`：`run_agent()` 新增可选 `session_path` 参数（`pathlib.Path`）。启动时若该路径存在且非空，从中加载完整消息历史替代默认的 `[system, user]` 初始化；否则按原逻辑初始化并把这两条消息写入文件（如果传了 `session_path`）。此后每一条新增到 `messages` 的消息（assistant、tool、系统注入的提示）都会同步 `append_message` 落盘一份。
+- 测试/demo 方式：把一个 `MockLLM` 脚本切成前后两段。第一次 `run_agent(..., session_path=tmp_path)` 只喂前半段脚本——脚本耗尽后抛 `ScriptExhausted`，模拟"进程崩溃"；断言此时文件里已经落盘了预期条数的消息。第二次调用换一个全新的 `MockLLM`（`call_count` 从 0 开始，但脚本内容是后半段）+ 同一个 `session_path`，断言能从断点正确续跑、最终结果与"一次性跑完整段脚本"完全一致，且文件包含两段合并后的全部消息（验证是追加而不是覆盖）。
+- 局限性（会写进 v9 的 README）：只有消息历史被持久化，`Budget`/`ToolCircuitBreaker` 等运行时计数器进程重启后清零——这是刻意的简化，真实系统如果需要跨重启保留这些状态需要额外设计。
+
+### v10：并发工具调用 + 超时取消（不含真流式输出）
+
+- `harness/loop.py` 的 `run_agent()` 改为 `async def`；`mock_llm.py` 的 `MockLLM.chat()` 改为 `async def`；`tools.py` 的 `Tool.run()` 改为 `async def`，内部工具函数也相应改为 `async def`（不需要真实 I/O 等待的可以直接 `return`，不必额外 `await asyncio.sleep`）。
+- 同一轮 LLM 响应里的多个 `tool_calls`：验证/权限检查等同步、快速的判断仍按顺序做完，真正的执行阶段用 `asyncio.gather` 并发跑；每个工具调用外层套 `asyncio.wait_for(tool.run(args), timeout=timeout_seconds)`，超时抛出的 `asyncio.TimeoutError` 按普通失败处理（不重试、不影响其它并发中的调用），避免一个卡住的工具拖死整个循环。
+- 验证并发确实发生的方式：给参与并发测试的工具传入一个共享的"当前在途调用数"计数器（进入时 +1、退出前 -1，同时记录出现过的峰值），断言峰值 `> 1`；不使用真实的 `time.perf_counter()` 计时差值断言，避免测试因机器负载不同而 flaky。
+- 场景：① 一轮返回 2~3 个互相独立的 `tool_calls`，验证并发峰值 `>1` 且每个调用的结果被正确对应回各自的 `call["id"]`；② 一个人为"耗时超过 `timeout_seconds`"的工具被 `asyncio.wait_for` 正确取消，运行继续而不是挂起（用极短的 `timeout_seconds`，如 0.05 秒，配合一个 `await asyncio.sleep(0.2)` 的慢工具，保持测试快速且确定性强）。
+- `main.py` 用 `asyncio.run(main_async())` 包一层，CLI 使用方式不变。
+- 明确不实现真正的流式增量输出：`MockLLM` 一次性返回完整 response，没有真实的增量 chunk 可流，强行拆字符流没有教学意义——这一简化会记录进 v10 的 README，作为对设计文档"并发与流式"标题的范围说明。
+
+### v11：安全权限沙箱
+
+- 新增 `harness/permissions.py`：`check_permission(call, policy) -> "allow" | "ask" | "deny"`，`policy` 是一个 `{tool_name: rule}` 的简单字典，未出现在字典里的工具默认 `"allow"`。
+- `harness/loop.py`：`run_agent()` 新增 `permission_policy`（字典，默认全 `"allow"`）和 `approve_fn`（可调用对象，签名 `approve_fn(call) -> bool`，默认是一个基于 `input()` 的真实终端询问函数）两个参数。在校验通过、进入并发执行阶段之前，先对每个 `tool_calls` 做一次同步的权限过滤：`"deny"` 直接回填系统消息拒绝执行；`"ask"` 调用 `approve_fn(call)`，返回 `False` 就同样回填拒绝消息，返回 `True` 才进入待并发执行的列表；只有权限过滤后剩下的调用才会被 `asyncio.gather` 并发执行。
+- 测试用确定性的假 `approve_fn`（要么恒定返回 `True`，要么恒定返回 `False`）驱动两种分支；`"deny"` 规则的场景不依赖 `approve_fn`，用来验证"deny 优先级高于任何审批回调"。
+- 场景：① `write_file` 配置为 `"ask"`，假 `approve_fn` 批准 → 正常执行成功；② 同一个场景换成拒绝的假 `approve_fn` → 优雅回填拒绝消息、模型换一种方式完成任务（复用 v6/v7 已经验证过的"自纠正"叙事）；③ 一个配置为 `"deny"` 的危险工具（如模拟的 `delete_everything`）无论 `approve_fn` 是什么都被拦截。
+
+### v8~v11 相对设计文档的范围确认
+
+- v10 标题虽然是"并发与流式"，但本批次刻意把"流式"限定为不实现（详见上方 v10 小节的说明），只做并发工具调用与超时取消。这是与用户确认过的范围收敛，不是实现中途的缩水。
+- v8~v11 延续 v1~v7"完全自包含、不跨版本 import"的原则；v8/v9 每个版本仍是同步代码，v10 起才引入 `asyncio`，形成第二条"架构基线"，v11~v15 都会建立在 v10 引入的 async 循环之上。
