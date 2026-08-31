@@ -18,6 +18,7 @@ _SUB_AGENT_COMPRESSION_CONFIG = {
     "max_compressions": 3,
     "keep_recent_count": 6,
 }
+_SUB_AGENT_MAX_STEPS = 10
 
 
 class Tool:
@@ -125,7 +126,7 @@ def build_default_tool_registry(concurrency_tracker=None, sub_task_scripts=None)
         sub_goal, sub_script = sub_task_scripts[subtask]
         sub_registry = build_default_tool_registry()
         sub_llm = MockLLM(sub_script)
-        sub_budget = Budget(max_steps=10)
+        sub_budget = Budget(max_steps=_SUB_AGENT_MAX_STEPS)
 
         try:
             sub_result = await run_agent(
