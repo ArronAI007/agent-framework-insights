@@ -4,6 +4,7 @@ from pathlib import Path
 
 from harness.budget import Budget
 from harness.loop import run_agent
+from harness.session_store import load_session
 from mock_llm import MockLLM, ScriptExhausted
 from scenarios import get_scenario
 from tools import build_default_tool_registry
@@ -55,6 +56,13 @@ def main():
     tool_registry = build_default_tool_registry()
     budget = Budget(max_steps=args.max_steps)
     session_path = Path(args.session_file) if args.session_file else None
+
+    if session_path is not None:
+        existing = load_session(session_path)
+        if existing:
+            print(f"[会话] 从 {len(existing)} 条历史消息续跑")
+        else:
+            print("[会话] 新建会话")
 
     try:
         result = run_agent(
