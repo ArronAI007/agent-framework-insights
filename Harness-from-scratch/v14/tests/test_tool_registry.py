@@ -49,6 +49,16 @@ def test_tool_registry_unregister_missing_tool_is_a_no_op():
     assert "does_not_exist" not in registry
 
 
+def test_tool_registry_supports_plain_dict_style_deletion():
+    # harness/loop.py 的循环检测（v3）直接用 `del tool_registry[blocked]` 禁用工具，
+    # 从未调用 unregister()——这条测试确认 ToolRegistry 没有覆盖 __delitem__，
+    # 这个已有调用方式在 dict 子类上原样可用。
+    registry = ToolRegistry()
+    registry.register(Tool("noop", _noop, {}))
+    del registry["noop"]
+    assert "noop" not in registry
+
+
 def test_weather_lookup_is_unknown_before_plugin_loaded():
     registry = build_default_tool_registry()
     call = {"name": "weather_lookup", "args": {"city": "北京"}}
