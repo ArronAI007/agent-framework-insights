@@ -15,7 +15,7 @@
 
 **为什么用"一个会递归调用 `run_agent()` 的工具"而不是引入一个新的 `Orchestrator` 抽象层**：这个系列从 v1 起的核心哲学就是"一个工具就是一个能力"——`delegate_task` 完美契合这个哲学：从主循环的视角看，委派子任务和调用 `search_web`没有任何区别，都是"发起一次调用、等待结果、把结果塞进消息历史"。引入一个显式的编排层会破坏这种一致性，也会让 v15 看起来像是一个跟前 14 个版本风格不搭的"外挂"。
 
-**为什么子 agent 的 `tool_registry` 不传 `sub_task_scripts`（也就是子 agent 自己没有 `delegate_task` 工具）**：这是刻意阻止无限递归委派——如果子 agent 也能调用 `delegate_task`，理论上可以委派出委派链，复杂度和潜在的失控风险都会显著上升，超出"最小可行的多智能体协作"这个教学目标。真实系统如果需要支持多层委派，需要额外设计委派深度限制、循环委派检测等机制，这些都留给读者自行扩展。
+**为什么子 agent 的 `tool_registry` 不传 `sub_task_scripts` 能阻止无限递归委派**：需要澄清一个容易讲错的细节——`build_default_tool_registry()` 是无条件把 `delegate_task` 注册进返回的 registry 的，所以子 agent 的注册表里**确实还有** `delegate_task` 这个工具键，并不是"工具不存在"。真正起作用的是 `delegate_task` 内部闭包捕获的 `sub_task_scripts`：子 agent 是用 `build_default_tool_registry()`（不传 `sub_task_scripts`）构建的，所以它自己的 `delegate_task` 闭包里 `sub_task_scripts` 默认是空字典 `{}`——不管子 agent 的模型想委派什么子任务名，查表都会立刻失败，返回 `"Error: 未知子任务 ..."`，委派链在这里就被截断了，根本不会真的递归下去。也就是说，阻止无限递归的不是"移除了工具"，而是"每一层子 agent 手里的查表字典都是空的"，这个机制上的差别值得说清楚，避免以后有人真的去检查 `"delegate_task" in sub_registry` 时被"工具应该不存在"这个错误预期搞糊涂。真实系统如果需要支持多层委派，需要额外设计委派深度限制、循环委派检测等机制，这些都留给读者自行扩展。
 
 **为什么 `delegate_task` 要 `try/except ScriptExhausted`**：子 agent 内部也会经历 v1~v14 讲过的全部风险（脚本可能因为各种原因提前耗尽），如果不捕获，这个异常会直接从 `delegate_task` 这个工具函数里往外抛，扎穿 `_execute_call` 的 `except Exception` 兜底（`ScriptExhausted` 确实是 `Exception` 的子类，理论上会被外层 `except Exception` 接住而不是让主循环崩溃——但这样处理会把子任务失败误判成一次普通的工具执行失败，走向重试/熔断逻辑，语义上是错的：子任务没跑完不是因为工具本身不可靠，重试也解决不了"脚本没写够"这个问题）。在 `delegate_task` 内部就近捕获、转换成一条说明性文字，语义更准确，也让主循环能拿到一个有意义的失败摘要继续往下推进，而不是被无谓地重试。
 
