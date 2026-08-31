@@ -44,6 +44,7 @@ async def run_main(args):
             DEFAULT_COMPACT_CONFIG,
             DEFAULT_COMPRESSION_CONFIG,
             session_path=session_path,
+            timeout_seconds=args.timeout,
         )
         print(f"[结果] {result}")
     except ScriptExhausted as exc:
@@ -81,6 +82,12 @@ def main():
         type=str,
         default=None,
         help="会话落盘路径；指定后支持断点续跑",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="单次工具调用的超时秒数",
     )
     args = parser.parse_args()
     asyncio.run(run_main(args))

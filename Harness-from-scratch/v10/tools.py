@@ -61,6 +61,12 @@ def build_default_tool_registry(concurrency_tracker=None):
                 concurrency_tracker.exit()
 
     async def write_file(path, content):
+        # 注意：这里在修改 fake_fs 之前没有任何 await 点，所以一旦这个协程被
+        # asyncio 调度执行，就会在一个事件循环 tick 内直接跑完，asyncio.wait_for
+        # 的超时永远没有机会在"已经开始写但还没写完"的中间状态把它打断。这个
+        # 对超时的"安全性"只是这个函数恰好没有提前 await 带来的副产品，并不是
+        # 刻意设计、可以依赖的保证——如果未来给 write_file 加上真实的 I/O 延迟
+        # （比如先 await 一次网络或磁盘调用再写入 fake_fs），这个假设就不再成立。
         fake_fs[path] = content
         return f"已写入 {path}（{len(content)} 字符）"
 
