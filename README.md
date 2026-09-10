@@ -1,6 +1,6 @@
 # Agent Framework Insights
 
-> 五套面向"彻底剖析"的中文技术课程,分别系统性拆解五个真实开源 Agent Harness 项目的架构：先会用，再懂原理，最后能扩展。每篇文章都摘录真实源码并逐段讲解设计动机，而不是停留在使用文档层面。
+> 六套面向"彻底剖析"的中文技术课程,分别系统性拆解六个真实开源 Agent Harness 项目的架构：先会用，再懂原理，最后能扩展。每篇文章都摘录真实源码并逐段讲解设计动机，而不是停留在使用文档层面。
 
 ## 课程一：PI（[earendil-works/pi](https://github.com/earendil-works/pi)）
 
@@ -119,20 +119,45 @@ DeepSeek AI 开源的 agent harness：整个运行时构建在 Cordis 这个"万
 
 </details>
 
-## 五个项目的架构哲学速览
+## 课程六：OpenWorker（[andrewyng/openworker](https://github.com/andrewyng/openworker)）
 
-| | PI | DeepSeek Harness | Hermes Agent | OpenHarness | OpenClaw |
-|---|---|---|---|---|---|
-| 定位 | 极简终端编码 Agent | 万物皆插件的通用 Agent Harness | 自我进化、多平台常驻的个人/团队 Agent | Python 版 Claude Code 复刻 + 基于它构建的个人 Agent App（`ohmo`） | 单一 Gateway 统一调度模型/工具/消息渠道/设备的个人与团队助理平台 |
-| 扩展方式 | 精简核心 + TypeScript Extension / Skills / Prompt 模板 | 万物皆插件（Cordis），能力按 Service Definition / Provider / Tool 三元结构组织 | 文件目录 + manifest + 单一巨型 `PluginContext`；另有 Footprint Ladder 六级决策框架指导扩展面选型 | 工具 / Skills / Plugins / MCP 四条并行扩展面，无独立元框架，工具协议直接对齐 Claude Code 官方工具集 | Code Plugin（进程内同等信任，深度运行时扩展）与 Bundle-style Plugin（打包稳定外部能力，信任边界窄）二级明确区分，"核心瘦身、能力下沉插件"写进产品愿景 |
-| 框架依赖 | 无独立元框架，扩展机制内建于 `coding-agent` 包 | 依赖 vendor 进仓库的 Cordis 生态（源码自持，可审计可打补丁） | 无独立元框架，插件发现内建于 `hermes_cli/plugins.py` | 无独立元框架；`channels/bus`、`channels/impl` 直接 vendor 自另一个开源项目 `nanobot-ai/nanobot` | 无独立元框架，但有独立的插件市场 ClawHub 承担发现/发布者身份/安全审查 |
-| 多模型层 | `pi-ai` 统一接口 | `packages/llm/*` seam + `llm-deepseek`/`llm-pi-ai` 双 Provider 对照验证 | `providers/` Profile 元数据（多数 provider）+ 少数原生 Adapter（Anthropic/Bedrock/Gemini/Codex）混合路线 | `SupportsStreamingMessages` Protocol + 4 个具体客户端；workflow + profile 抽象；Copilot 客户端靠组合/monkeypatch OpenAI 客户端实现 | Provider 插件 SDK 契约 + 两阶段 Failover（认证 profile 轮换 → 模型降级）+ 独立的 operation 级重试层，154 个 extension 里 79 个声明 provider |
-| 会话表示 | JSONL append 日志 | 事件溯源日志（`SessionEventMap`）+ Surface 投影，压缩靠 `replace` 而非删除 | SQLite（WAL + FTS5 + 自研 CJK 分词），mixin 拆分 search/schema/portability，`parent_session_id` 链支撑压缩拆分 | 纯 JSON 快照，每轮对话后落盘；另有独立的 Markdown "session memory" 检查点服务于压缩边界 | 强制 SQLite（`AGENTS.md` 明文禁止新增 JSON/JSONL 运行时存储），main session + 多种 reset 模式 + 硬性裁剪安全规则 |
-| 沙箱 | 依赖外部容器化 | 自建多平台沙箱（bwrap / Seatbelt / 纯 C 手写 Landlock / Windows ACL）+ E2B 远程 | 七种可插拔终端后端（local/docker/ssh/singularity/modal/daytona/vercel）+ 批准模式（启发式）+ 网络出口隔离（OS 级） | 默认后端包装 Anthropic 外部 `srt` CLI（bubblewrap/sandbox-exec），Docker 为第二可选后端，两者靠字符串分发而非共享接口 | 沙箱/工具策略/提权三层边界；云沙箱能力被明确导流到独立项目 Crabbox 而非做成插件；审计留痕明确不等于授权 |
-| 部署/进程形态 | 单一 CLI 进程 | Host（Node）/ Client（浏览器）类型与构建物理分离，Typert 编译期生成 RPC 契约 | 单进程多平台 Gateway，四种前端（classic CLI / Ink TUI / Dashboard 内嵌 PTY / Electron）共享同一套 JSON-RPC 协议 | 三种前端服务三种场景：Ink/React 终端 TUI（子进程 + 自定义 JSON 行协议）、Textual 备用界面（未接线的正交实现）、React/Vite 静态仪表盘（可发布 GitHub Pages） | 单一常驻 Gateway + WS 协议服务 CLI/Dashboard/TUI/4 个原生 App(macOS/iOS/Android/Linux)/Node 设备；TypeBox 单一数据源并行生成 Swift 与 Kotlin 类型 |
-| 独有卖点 | 核心足够小，可作为引擎单独复用 | 自研沙箱内核 + 编译期生成 RPC 契约 | Skills 自我进化学习环（`/learn` + curator）+ Chronos 托管无服务器化 cron + 面向训练数据的 batch_runner | `ohmo` 个人 Agent App（人格化 system prompt + 十种 IM 平台网关 + Cron 主动触发）+ 零运维 Autopilot 快照仪表盘 | Gateway 统一配对信任模型把模型/十余种消息渠道/4 端原生 App/设备能力(相机/屏幕/位置)纳入同一套架构；Soul + Dreaming 人格与记忆长期演化机制 |
+Andrew Ng 团队开源的桌面 AI coworker：定位是"交付真实成品而非聊天"——代码审查带着修复方案、排好版的文档、一条带数据的 Slack 回复、一个分诊好的收件箱，首发专精安全类工作的专家角色（appsec/cloud-posture/dep-audit 等）。核心是一个约 5 万行的 Python 后端，桌面壳是 React + Tauri，语音输入模块用 Rust 编译期静态链接进同一个二进制；整个 Agent 引擎构建在 Andrew Ng 团队另一个开源库 aisuite 之上，自己只做治理与产品化。最独特的地方是"Governed by design"——三层治理（人类专属的硬底线、一把自主权阶梯外加 auto-approve 模式下的 Reviewer 审查模型、能回答"谁做的为什么"的审计轨迹），外加一整套独立的、数据驱动的方法论持续评测 Reviewer 模型本身的表现，这在六个项目里是独有的内容。这个项目没有丰富的官方文档库，课程主要依据源码、README、SECURITY.md 和 `pyproject.toml` 里大量的解释性注释写成。
 
-建议按 PI → DeepSeek Harness → Hermes Agent → OpenHarness → OpenClaw 的顺序阅读——前四者已经在不同规模下几乎处处做出了不同的架构选择，OpenClaw 则把同一类问题推向了目前这套课程系列里最大的规模：仅 `docs/` 就有 800 多篇文档、155 个 extensions、四个原生 App，逼着它必须把"核心该做什么、生态该做什么"写成一条明确的产品哲学（VISION.md 的"两层两条门槛"），否则系统会在自身复杂度下失控。对照阅读收获会比单读一套更大。第 08 章第 2 篇（[插件架构对比精讲](Hermes-Agent/08-插件系统与协议生态/02-插件架构对比精讲-Hermes-vs-Pi-vs-OpenCode.md)）更是直接改写自 Hermes 团队对 Pi 插件架构的源码级评审，读完 PI 课程再读这一篇会有额外收获。
+👉 从 [OpenWorker/00-课程导读/README.md](OpenWorker/00-课程导读/README.md) 开始。
+
+<details>
+<summary>展开完整目录（39 篇）</summary>
+
+- **00-课程导读**：[README](OpenWorker/00-课程导读/README.md)
+- **01-快速上手**：[安装与桌面应用速览](OpenWorker/01-快速上手/01-安装与桌面应用速览.md) · [从源码运行与开发环境](OpenWorker/01-快速上手/02-从源码运行与开发环境.md) · [模型与 Provider 配置速览](OpenWorker/01-快速上手/03-模型与Provider配置速览.md) · [权限模式与治理速览](OpenWorker/01-快速上手/04-权限模式与治理速览.md)
+- **02-仓库全景与工程实践**：[Monorepo 结构与技术栈全景](OpenWorker/02-仓库全景与工程实践/01-Monorepo结构与技术栈全景.md) · [基于 aisuite 的分层关系](OpenWorker/02-仓库全景与工程实践/02-基于aisuite的分层关系.md) · [测试与评测体系](OpenWorker/02-仓库全景与工程实践/03-测试与评测体系.md)
+- **03-Agent 核心循环与会话**：[Engine 总览：agent 与 engine 的分工](OpenWorker/03-Agent核心循环与会话/01-Engine总览-agent与engine的分工.md) · [Session 与对话数据模型](OpenWorker/03-Agent核心循环与会话/02-Session与对话数据模型.md) · [上下文压缩 Compaction](OpenWorker/03-Agent核心循环与会话/03-上下文压缩Compaction.md) · [事件流与流式输出](OpenWorker/03-Agent核心循环与会话/04-事件流与流式输出.md)
+- **04-治理系统：三层门槛与审批**：[权限模式与三层门槛总览](OpenWorker/04-治理系统-三层门槛与审批/01-权限模式与三层门槛总览.md) · [Permissions 与 Risk 风险评估](OpenWorker/04-治理系统-三层门槛与审批/02-Permissions与Risk风险评估.md) · [Reviewer 自动审查模型](OpenWorker/04-治理系统-三层门槛与审批/03-Reviewer自动审查模型.md) · [Provenance 与 Audit 审计追踪](OpenWorker/04-治理系统-三层门槛与审批/04-Provenance与Audit审计追踪.md) · [Overrides：常驻规则与 Allowlist 晋升机制](OpenWorker/04-治理系统-三层门槛与审批/05-Overrides-常驻规则与Allowlist晋升机制.md)
+- **05-模型与 Provider 生态**：[Provider 抽象与统一接口](OpenWorker/05-模型与Provider生态/01-Provider抽象与统一接口.md) · [代表性 Provider 实现对照](OpenWorker/05-模型与Provider生态/02-代表性Provider实现对照.md) · [模型目录 Catalog 与能力矩阵](OpenWorker/05-模型与Provider生态/03-模型目录Catalog与能力矩阵.md)
+- **06-工具 / Skills / MCP 与 Toolchain**：[内置工具全解析](OpenWorker/06-工具-Skills-MCP与Toolchain/01-内置工具全解析.md) · [Skills 机制与内置技能包](OpenWorker/06-工具-Skills-MCP与Toolchain/02-Skills机制与内置技能包.md) · [MCP 集成](OpenWorker/06-工具-Skills-MCP与Toolchain/03-MCP集成.md) · [Toolchain 装配与 Web 工具](OpenWorker/06-工具-Skills-MCP与Toolchain/04-Toolchain装配与Web工具.md)
+- **07-Connectors 连接器生态**：[Connector 契约与 Gateway 架构](OpenWorker/07-Connectors连接器生态/01-Connector契约与Gateway架构.md) · [代表性 Connector 实现对照](OpenWorker/07-Connectors连接器生态/02-代表性Connector实现对照.md) · [浏览器自动化与邮件工具](OpenWorker/07-Connectors连接器生态/03-浏览器自动化与邮件工具.md) · [OAuth 与 Cloud 代理服务](OpenWorker/07-Connectors连接器生态/04-OAuth与Cloud代理服务.md)
+- **08-Personas 与 Teams：多智能体协作**：[Persona 清单与专家 Coworker 设计](OpenWorker/08-Personas与Teams多智能体/01-Persona清单与专家Coworker设计.md) · [Teams / Board 与 Journal 多智能体协作](OpenWorker/08-Personas与Teams多智能体/02-Teams-Board与Journal多智能体协作.md) · [Subagent 委派与 MCP 开放接口](OpenWorker/08-Personas与Teams多智能体/03-Subagent委派与MCP开放接口.md)
+- **09-记忆与自动化**：[Memory 记忆系统](OpenWorker/09-记忆与自动化/01-Memory记忆系统.md) · [Automation 调度与 Standing Automation](OpenWorker/09-记忆与自动化/02-Automation调度与Standing-Automation.md) · [无人值守运行与自我唤醒机制](OpenWorker/09-记忆与自动化/03-无人值守运行与自我唤醒机制.md)
+- **10-桌面应用与语音输入**：[GUI/Tauri 桌面壳架构](OpenWorker/10-桌面应用与语音输入/01-GUI-Tauri桌面壳架构.md) · [语音输入 Sidecar 与跨技术栈工程](OpenWorker/10-桌面应用与语音输入/02-语音输入Sidecar与跨技术栈工程.md)
+- **11-安全模型与 Reviewer 评测方法论**：[安全模型与 SECURITY.md](OpenWorker/11-安全模型与Reviewer评测方法论/01-安全模型与SECURITY-md.md) · [Reviewer 模型评测方法论](OpenWorker/11-安全模型与Reviewer评测方法论/02-Reviewer模型评测方法论.md)
+- **12-总结与延伸阅读**：[课程总结与延伸阅读](OpenWorker/12-总结与延伸阅读/01-课程总结与延伸阅读.md)
+
+</details>
+
+## 六个项目的架构哲学速览
+
+| | PI | DeepSeek Harness | Hermes Agent | OpenHarness | OpenClaw | OpenWorker |
+|---|---|---|---|---|---|---|
+| 定位 | 极简终端编码 Agent | 万物皆插件的通用 Agent Harness | 自我进化、多平台常驻的个人/团队 Agent | Python 版 Claude Code 复刻 + 基于它构建的个人 Agent App（`ohmo`） | 单一 Gateway 统一调度模型/工具/消息渠道/设备的个人与团队助理平台 | 交付真实成品而非聊天的桌面 AI coworker，首发安全类专家角色 |
+| 扩展方式 | 精简核心 + TypeScript Extension / Skills / Prompt 模板 | 万物皆插件（Cordis），能力按 Service Definition / Provider / Tool 三元结构组织 | 文件目录 + manifest + 单一巨型 `PluginContext`；另有 Footprint Ladder 六级决策框架指导扩展面选型 | 工具 / Skills / Plugins / MCP 四条并行扩展面，无独立元框架，工具协议直接对齐 Claude Code 官方工具集 | Code Plugin（进程内同等信任，深度运行时扩展）与 Bundle-style Plugin（打包稳定外部能力，信任边界窄）二级明确区分，"核心瘦身、能力下沉插件"写进产品愿景 | Persona（专家角色 + Skills）+ Connectors（25+ 集成）+ MCP 三条并行，核心自身精简，工具 schema 生成复用共享库 aisuite |
+| 框架依赖 | 无独立元框架，扩展机制内建于 `coding-agent` 包 | 依赖 vendor 进仓库的 Cordis 生态（源码自持，可审计可打补丁） | 无独立元框架，插件发现内建于 `hermes_cli/plugins.py` | 无独立元框架；`channels/bus`、`channels/impl` 直接 vendor 自另一个开源项目 `nanobot-ai/nanobot` | 无独立元框架，但有独立的插件市场 ClawHub 承担发现/发布者身份/安全审查 | 依赖 Andrew Ng 团队另一个开源库 aisuite（git commit 精确锁版本），只在工具 schema 生成层被复用，核心循环本身不依赖它 |
+| 多模型层 | `pi-ai` 统一接口 | `packages/llm/*` seam + `llm-deepseek`/`llm-pi-ai` 双 Provider 对照验证 | `providers/` Profile 元数据（多数 provider）+ 少数原生 Adapter（Anthropic/Bedrock/Gemini/Codex）混合路线 | `SupportsStreamingMessages` Protocol + 4 个具体客户端；workflow + profile 抽象；Copilot 客户端靠组合/monkeypatch OpenAI 客户端实现 | Provider 插件 SDK 契约 + 两阶段 Failover（认证 profile 轮换 → 模型降级）+ 独立的 operation 级重试层，154 个 extension 里 79 个声明 provider | `ProviderClient` 统一接口 + 前缀路由；约 9 家厂商共享一个 `OpenAIProvider` 类，仅 Anthropic/Gemini 原生实现，Vertex/Bedrock 靠组合复用而非独立协议 |
+| 会话表示 | JSONL append 日志 | 事件溯源日志（`SessionEventMap`）+ Surface 投影，压缩靠 `replace` 而非删除 | SQLite（WAL + FTS5 + 自研 CJK 分词），mixin 拆分 search/schema/portability，`parent_session_id` 链支撑压缩拆分 | 纯 JSON 快照，每轮对话后落盘；另有独立的 Markdown "session memory" 检查点服务于压缩边界 | 强制 SQLite（`AGENTS.md` 明文禁止新增 JSON/JSONL 运行时存储），main session + 多种 reset 模式 + 硬性裁剪安全规则 | 会话/对话数据模型 + "冻结一次性快照 + 仅追加摄取日志"（非滚动摘要）+ SQLite 记忆存储 |
+| 沙箱/治理 | 依赖外部容器化 | 自建多平台沙箱（bwrap / Seatbelt / 纯 C 手写 Landlock / Windows ACL）+ E2B 远程 | 七种可插拔终端后端（local/docker/ssh/singularity/modal/daytona/vercel）+ 批准模式（启发式）+ 网络出口隔离（OS 级） | 默认后端包装 Anthropic 外部 `srt` CLI（bubblewrap/sandbox-exec），Docker 为第二可选后端，两者靠字符串分发而非共享接口 | 沙箱/工具策略/提权三层边界；云沙箱能力被明确导流到独立项目 Crabbox 而非做成插件；审计留痕明确不等于授权 | 三层治理（人类专属硬底线 + 自主权阶梯/Reviewer 审查模型/熔断 + 审计轨迹），配套独立的数据驱动方法论持续评测 Reviewer 模型本身的表现 |
+| 部署/进程形态 | 单一 CLI 进程 | Host（Node）/ Client（浏览器）类型与构建物理分离，Typert 编译期生成 RPC 契约 | 单进程多平台 Gateway，四种前端（classic CLI / Ink TUI / Dashboard 内嵌 PTY / Electron）共享同一套 JSON-RPC 协议 | 三种前端服务三种场景：Ink/React 终端 TUI（子进程 + 自定义 JSON 行协议）、Textual 备用界面（未接线的正交实现）、React/Vite 静态仪表盘（可发布 GitHub Pages） | 单一常驻 Gateway + WS 协议服务 CLI/Dashboard/TUI/4 个原生 App(macOS/iOS/Android/Linux)/Node 设备；TypeBox 单一数据源并行生成 Swift 与 Kotlin 类型 | Tauri 桌面壳监督 Python agent server 子进程，per-launch token 区分独立 server 落盘模式与桌面内存模式；语音识别模块编译期静态链接进同一二进制而非独立 sidecar |
+| 独有卖点 | 核心足够小，可作为引擎单独复用 | 自研沙箱内核 + 编译期生成 RPC 契约 | Skills 自我进化学习环（`/learn` + curator）+ Chronos 托管无服务器化 cron + 面向训练数据的 batch_runner | `ohmo` 个人 Agent App（人格化 system prompt + 十种 IM 平台网关 + Cron 主动触发）+ 零运维 Autopilot 快照仪表盘 | Gateway 统一配对信任模型把模型/十余种消息渠道/4 端原生 App/设备能力(相机/屏幕/位置)纳入同一套架构；Soul + Dreaming 人格与记忆长期演化机制 | 三层治理系统 + 独立的 Reviewer 评测方法论（"修复者不能是唯一检查者"哲学贯穿始终）+ 25+ 连接器交付真实工作产物 |
+
+建议按 PI → DeepSeek Harness → Hermes Agent → OpenHarness → OpenClaw → OpenWorker 的顺序阅读——前四者已经在不同规模下几乎处处做出了不同的架构选择，OpenClaw 把同一类问题推向了这套课程系列里最大的规模，OpenWorker 则示范了另一条路径：把跨 Provider 统一接口这类通用能力交给一个共享库（aisuite），自己把全部精力投入到"如何让一个真正能干活的 Agent 保持可控"这件事上——三层治理系统外加一整套持续评测 Reviewer 模型表现的方法论，是六个项目里独有的内容。对照阅读收获会比单读一套更大。第 08 章第 2 篇（[插件架构对比精讲](Hermes-Agent/08-插件系统与协议生态/02-插件架构对比精讲-Hermes-vs-Pi-vs-OpenCode.md)）更是直接改写自 Hermes 团队对 Pi 插件架构的源码级评审，读完 PI 课程再读这一篇会有额外收获。
 
 ---
 
