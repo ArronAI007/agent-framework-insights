@@ -41,4 +41,4 @@ Pi 是一个**极简终端编码 Agent（coding agent）项目**，对外提供�
 
 ## 课程目录
 
-完整的目录导航见仓库根目录的 [README.md](../README.md)。
+完整的目录导航见仓库根目录的 [README.md](../../README.md)。

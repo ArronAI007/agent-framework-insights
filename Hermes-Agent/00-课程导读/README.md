@@ -31,7 +31,7 @@ Hermes Agent 是 [Nous Research](https://nousresearch.com) 开源的**自我进�
 11. **测试评估与研究工具**（第 11 章）：测试策略、批量轨迹生成与轨迹压缩。
 12. **总结与延伸阅读**（第 12 章）。
 
-完整目录导航见仓库根目录的 [README.md](../README.md)。
+完整目录导航见仓库根目录的 [README.md](../../README.md)。
 
 ## 适合谁学
 

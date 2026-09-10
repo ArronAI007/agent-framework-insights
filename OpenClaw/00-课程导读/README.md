@@ -57,4 +57,4 @@ OpenClaw 是这套课程系列迄今规模最大的项目——仅 `docs/` 目�
 
 ## 课程目录
 
-完整的目录导航见仓库根目录的 [README.md](../README.md)。
+完整的目录导航见仓库根目录的 [README.md](../../README.md)。

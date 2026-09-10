@@ -46,4 +46,4 @@ DeepSeek Harness（`dsh`）是 DeepSeek AI 开源的一个 **agent harness（智
 
 ## 课程目录
 
-完整的目录导航见仓库根目录的 [README.md](../README.md)。
+完整的目录导航见仓库根目录的 [README.md](../../README.md)。

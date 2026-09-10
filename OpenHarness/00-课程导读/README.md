@@ -52,4 +52,4 @@ OpenHarness（`oh`）是香港大学数据科学研究院（HKUDS）开源的一
 
 ## 课程目录
 
-完整的目录导航见仓库根目录的 [README.md](../README.md)。
+完整的目录导航见仓库根目录的 [README.md](../../README.md)。
