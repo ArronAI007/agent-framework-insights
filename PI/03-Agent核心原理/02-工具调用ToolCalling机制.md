@@ -281,6 +281,8 @@ async function executeToolCallsParallel(currentContext, assistantMessage, toolCa
 }
 ```
 
+> **订正（对照当前源码）**：`finalizedCalls.push(async () => { ... })` 内部现在多了一步前置检查——如果 `signal` 在这个具体的工具调用**真正开始执行之前**（比如它在预检阶段之后、还没轮到 `Promise.all` 把它跑起来的这段间隙）就已经被中止,会直接短路成一条 `"Operation aborted"` 的错误结果并 `emit(tool_execution_end)`,不再调用 `executePreparedToolCall`。这填补了一个边界情况：并行批次里排在后面的调用,理论上可能在自己真正开始跑之前,abort 信号就已经到达,如果不做这个检查,这次调用既不会产出正常结果,也不会触发 `tool_execution_end`,导致依赖"每个 `toolCall` 都有始有终"的上层状态（UI 渲染、遥测计数)出现悬空账目。
+
 `tool_execution_start` 是按 assistant 消息里的原始顺序（也就是"预检"阶段）依次触发的,而真正的执行是通过 `Promise.all` 并发展开的,`tool_execution_end` 则按**谁先执行完谁先触发**（完成顺序）。但最终代表工具结果、真正写入上下文的 `message_start`/`message_end`（`toolResult` 消息）事件,依然是`orderedFinalizedCalls` 按**原始顺序**遍历后依次 emit——这保证了无论并发执行的实际完成顺序如何,模型在下一轮看到的上下文里,工具结果始终和它发起的 `toolCall` 顺序一致。这个"预检顺序 / 完成顺序 / 落盘顺序"三者分离的设计,在 `packages/coding-agent/docs/extensions.md` 里也被明确写成了扩展开发者需要了解的行为保证。
 
 ## 关键代码解读

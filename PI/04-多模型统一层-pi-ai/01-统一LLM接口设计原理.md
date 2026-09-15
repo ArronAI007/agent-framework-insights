@@ -33,7 +33,7 @@ pi-ai 没有选择"运行时反射不同 Provider 的响应结构"，而是用 T
 `packages/ai/src/types.ts` 定义了三种消息角色，构成一次对话的完整历史：
 
 ```ts
-// packages/ai/src/types.ts:409-455
+// packages/ai/src/types.ts:422-467（节选，已省略部分 JSDoc 注释）
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
@@ -46,9 +46,16 @@ export interface AssistantMessage {
 	api: Api;
 	provider: ProviderId;
 	model: string;
+	responseModel?: string; // 与请求的 model 不同时的实际应答模型，如 OpenRouter "auto" -> "anthropic/..."
+	responseId?: string; // 上游 API 暴露的响应/消息 ID
+	providerThinkingLevel?: string; // 本次响应实际使用的厂商原生推理等级
+	diagnostics?: AssistantMessageDiagnostic[]; // 脱敏后的 provider/runtime 诊断信息，用于失败与自动恢复场景
 	usage: Usage;
 	stopReason: StopReason;
+	deferred?: DeferredHandle; // 该消息对应一次"延迟"响应（见下文 deferred 机制）时的句柄
 	errorMessage?: string;
+	rawStopReason?: string; // 厂商原始的终止原因字符串，未经收窄，仅用于调试
+	endTurn?: boolean; // 厂商是否明确表示"本轮结束"，目前只用于调试，不影响控制流
 	timestamp: number;
 }
 
@@ -57,6 +64,9 @@ export interface ToolResultMessage<TDetails = any> {
 	toolCallId: string;
 	toolName: string;
 	content: (TextContent | ImageContent)[];
+	details?: TDetails;
+	usage?: Usage; // 工具执行本身消耗的用量，不计入主对话的 LLM 用量统计
+	addedToolNames?: string[]; // 支持"延迟工具加载"的厂商在这里声明新解锁的工具名
 	isError: boolean;
 	timestamp: number;
 }
@@ -69,6 +79,8 @@ export type Message = UserMessage | AssistantMessage | ToolResultMessage;
 - `AssistantMessage` 上直接带着 `api`、`provider`、`model` 三个字段——每一条助手消息都"自带来源标签"，这样多轮对话中途切换模型（比如从 Anthropic 切到 Bedrock 上的 Claude）也能被完整记录和回放。
 - `content` 是一个联合类型数组，同一条助手消息里可以混排纯文本（`TextContent`）、推理过程（`ThinkingContent`，对应"思维链"/reasoning）、工具调用（`ToolCall`）。这直接对应了现代推理模型（如 Claude 的 extended thinking、OpenAI 的 reasoning）在一次回复里既要"想"又要"说"又要"调工具"的真实情况。
 - `ToolResultMessage` 里的 `content` 同样支持 `TextContent | ImageContent`，因为有些工具（比如截图、浏览器操作）返回的是图片而不是文本。
+- `AssistantMessage` 后来又补充了 `responseModel`/`responseId`/`providerThinkingLevel`/`diagnostics` 等一批"可观测性"字段：`responseModel` 用来记录 OpenRouter `auto` 之类路由型模型实际把请求转发给了谁；`providerThinkingLevel` 记录统一的 `reasoning` 等级最终被适配器换算成了厂商自己的哪个原生等级值；`diagnostics` 则把一次请求过程中发生的降级、重试、内容截断等运行时事件脱敏后挂在消息上，方便排障而不需要额外接遥测系统。这些都是"锦上添花"的可选字段，不影响核心的 `Message` 联合类型语义。
+- `ToolResultMessage` 新增的 `addedToolNames` 对应"延迟工具加载"（deferred tool loading）能力：部分厂商（如 Fireworks 的 Messages 协议）支持在返回工具执行结果的同时，动态解锁此前未声明的工具，`addedToolNames` 就是 Provider 适配器告诉上层"这些工具名现在可以用了"的信道；不支持这个机制的厂商忽略该字段，照常使用 `Context.tools` 里的静态工具列表。
 
 ### 2. 内容块类型：文本、思考、图片、工具调用
 
@@ -148,7 +160,7 @@ function mapStopReason(reason: string | undefined): { stopReason: StopReason; er
 ### 4. `Model<TApi>`：把 API 类型和厂商能力绑在一起
 
 ```ts
-// packages/ai/src/types.ts:794-823（节选）
+// packages/ai/src/types.ts:845-874（节选）
 export interface Model<TApi extends Api> {
 	id: string;
 	name: string;
@@ -162,6 +174,7 @@ export interface Model<TApi extends Api> {
 	contextWindow: number;
 	maxTokens: number;
 	samplingParams?: Record<string, unknown>;
+	headers?: Record<string, string>; // 该模型专属的额外请求头，如某些网关要求的路由/计费标记
 	compat?: TApi extends "openai-completions"
 		? OpenAICompletionsCompat
 		: TApi extends "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
@@ -243,6 +256,8 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 ```
 
 这是一个条件类型 + 索引访问类型的组合：已知的 10 种 API（见 `KnownApi`）会精确解析出各自的 Options 类型；自定义/未知的 API 字符串（`Api = KnownApi | (string & {})`，这是一个"开放字符串字面量"技巧，允许运行时扩展自定义 Provider 而不破坏类型系统）则退化为通用的 `StreamOptions`。
+
+`KnownApi` 里除了 OpenAI/Anthropic/Google/Bedrock/Mistral 这几家"真实厂商协议"，还有一个 `pi-messages`——这是 pi 自己定义的原生协议，用于 pi 的实验性协议服务（`packages/protocol`）和其他 Provider 之间做点对点转发，本身不对应任何外部厂商 API，但复用了同一套 `Model<TApi>`/`ProviderStreams` 抽象，说明这套类型系统不仅能描述"厂商 API"，也能描述"pi 内部的协议边界"。
 
 ### 7. `index.ts` 的导出边界：核心与外围分离
 

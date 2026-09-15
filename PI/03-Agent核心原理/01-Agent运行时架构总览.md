@@ -276,8 +276,9 @@ while (true) {
 		}
 
 		await emit({ type: "turn_end", message, toolResults });
-		// 4. shouldStopAfterTurn / prepareNextTurn 钩子,决定是否继续、是否换模型
-		// 5. 拉取新的 steering 消息,若有则继续内层循环
+		// 4. shouldStopAfterTurn 钩子,基于「刚结束这一轮」的原始上下文决定是否收尾
+		// 5. 若继续,在下一轮真正开始前才调用 prepareNextTurn 钩子(见下方订正)
+		// 6. 拉取新的 steering 消息,若有则继续内层循环
 	}
 
 	// 内层循环退出意味着"这一轮没有工具调用、也没有待处理消息"
@@ -293,6 +294,10 @@ await emit({ type: "agent_end", messages: newMessages });
 ```
 
 内层循环的终止条件是`!hasMoreToolCalls && pendingMessages.length === 0`——即模型这次回复没有工具调用（真正说完了话）,且没有排队的 steering 消息。外层循环则用于处理"agent 已经打算收尾,但这时候有 follow-up 消息排队"的场景（比如用户在等待过程中又发了一条新消息,选择让它在当前回合真正结束后才被处理,而不是打断当前回合）。`hasMoreToolCalls` 还受 `executedToolBatch.terminate` 影响——如果所有工具结果都标记了 `terminate: true`（例如被 `beforeToolCall` 钩子拦截并要求提前终止）,即便还有后续工具调用逻辑上"应该"继续,循环也会提前退出。
+
+> **订正（对照当前源码）**：早期实现里 `prepareNextTurn` 紧跟在 `turn_end` 之后、`shouldStopAfterTurn` 判断之前调用,这意味着 `shouldStopAfterTurn` 看到的其实是已经被 `prepareNextTurn`（例如压缩)改写过的上下文。当前 `agent-loop.ts` 把两者的顺序换了过来：`shouldStopAfterTurn` 现在直接消费 `turn_end` 产出的原始 `lastCompletedTurn`,而 `prepareNextTurn` 被推迟到"确定还要继续、下一轮真正开始之前"才执行。这样"是否要收尾"和"下一轮上下文该长什么样"这两个决策就不再互相污染。同时,由于 `prepareNextTurn` 可能是耗时操作（典型场景就是触发一次同步压缩),循环在它跑完之后会**再拉一次** steering 消息,避免用户在压缩期间的插话被漏掉,但只在此前一次没拉到消息时才补拉,防止在"逐条投递"模式下一个回合内重复投递两条 steering 消息。
+>
+> 同一批修复里,`executeToolCallsParallel` 也补上了一个小的健壮性修复：并行执行一批工具调用时,如果 `signal` 在某个工具调用真正开始执行前就已经被中止（比如用户按下了 Esc),现在会直接产出一条 `"Operation aborted"` 的错误结果并正常 `emit(tool_execution_end)`,而不是让这次调用悬空、导致依赖"每个 toolCall 都有对应 tool_execution_end"的上层逻辑（比如 UI 渲染或遥测统计)状态错乱。
 
 ### `streamAssistantResponse`:从事件流到一条完整消息
 
@@ -376,6 +381,20 @@ export function getDefaultStreamFn(): StreamFn {
 ```
 
 `packages/coding-agent` 在启动时会调用 `setDefaultStreamFn()` 注入真正对接多家模型 Provider 的实现（`@earendil-works/pi-ai` 里的 `streamSimple`,详见第四模块「多模型统一层 pi-ai」）。这一层解耦意味着：只要实现符合 `StreamFn` 契约的函数（文档注释明确要求"不能抛异常,失败必须编码进返回的事件流里,以 `stopReason: "error"|"aborted"` 收尾"）,就可以把 pi 的 Agent 引擎接到任意模型后端上,`streamProxy` 就是一个官方给出的范例实现。
+
+## 新进展：`AgentHarness`——面向持久化与多 Lane 的下一代引擎
+
+本篇前面描述的 `Agent`/`agentLoop`/`AgentContext` 这一套,仍然是**当前 `pi` 交互式 CLI 实际在用的运行时**——`packages/coding-agent/src/core/agent-session.ts` 今天依旧直接从 `@earendil-works/pi-agent-core` 导入 `Agent`、`AgentContext`、`AgentEvent`、`AgentTool` 等类型来组装 `AgentSession`。但仓库里已经出现了一整套新的、体量远大于 `agent-loop.ts`（803 行)本身的子系统——`packages/agent/src/harness/`,对外通过 `createAgentHarness()`/`AgentHarness` 导出,值得在这里提前建立心智模型,后面几篇涉及会话、压缩、扩展点的内容都会引用到它。
+
+几个关键差异：
+
+- **不抛异常,用 `Result<T, E>` 表达失败**：`harness/result.ts` 定义了一套 `Result` 类型,像 `LaneBusy`、`InvalidMessage`、`NothingToCompact`、`UnknownSkill` 这些错误都作为可辨识联合的返回值,而不是 `throw`,调用方必须显式处理每一种失败分支。
+- **会话是引擎自身的一等公民**：`harness/session/` 里定义了 `Entry`（`message`/`compaction`/`branch_summary`/`custom` 四种类型)、可插拔的 `Storage`/`SessionRepo` 抽象,默认实现是 `harness/session/jsonl/`（JSONL 编解码 + 追加写入),另有一个纯内存实现 `memory.ts` 用于测试,以及独立发布的 `packages/session-backends/sqlite-node` 包——一个符合同一套 `SessionRepo` 契约的 SQLite 后端。也就是说,压缩、分支（fork)、会话持久化这些在 `packages/coding-agent` 里一直是"整车"自己实现的能力（对照第四、五篇的 `session-manager.ts`、`compaction.ts`),在 `AgentHarness` 里被整体下沉进了"引擎"包。
+- **压缩与分支摘要被拆成两个独立模块**：`harness/compaction/compaction.ts` 和 `harness/compaction/branch-summarization.ts` 分开维护,对应 `CompactionPreparation`/`CompactionSettings` 和 `BranchPreparation`/`BranchSummaryResult` 两套类型。
+- **面向"持久化可恢复"设计**：`RunResult`/`CompactionResult` 里出现了 `SuspendedRun`（挂起的运行,带一个 `DeferredHandle`)以及 `LaneBusy`/`InvalidLane` 这样的错误类型,说明这套引擎原生支持多条并发"车道（lane)"、以及运行被中途挂起后再恢复——这正对应仓库里那份 *durable harness implementation spec* 设计文档所描述的目标：让一次 Agent 运行可以脱离进程存活、随时挂起和恢复。
+- **系统提示词、Skills、Prompt 模板、Hook、遥测也被复制/迁移进了引擎包**：`harness/system-prompt.ts`、`harness/skills.ts`、`harness/prompt-templates.ts`、`harness/hooks.ts`、`harness/telemetry.ts` 与 `packages/coding-agent/src/core/` 下同名文件并存,前者是给 `AgentHarness` 用的新实现,后者是当前 CLI 仍在用的实现。
+
+**现状定位**：截至本课程更新时,`AgentHarness` 已经通过 `packages/agent/src/index.ts` 完整对外导出,并被 `packages/coding-agent/src/experimental/`（`session-worker.ts`、`services/worker.ts`、`mini/worker/run.ts`)以及 `packages/evals/src/pi-harness.ts` 实际使用,但**交互式主流程（也就是你敲 `pi` 命令进入的那个 CLI)仍然跑在本篇描述的经典 `Agent`/`agentLoop`/`AgentSession` 之上**。换句话说,`AgentHarness` 是 pi 团队正在孵化、逐步替换旧引擎的下一代实现,目前处于"实验性 worker 与评测系统先用起来,交互式 CLI 尚未切换"的阶段。理解经典引擎仍然是理解当前 pi 行为的基础,但如果你想面向未来做二次开发,`packages/agent/src/harness/` 是更值得关注的方向。
 
 ## 小结与思考题
 

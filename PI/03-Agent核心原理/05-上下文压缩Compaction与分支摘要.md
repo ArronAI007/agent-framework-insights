@@ -57,6 +57,8 @@ if (shouldCompact(contextTokens, contextWindow, settings)) {
 
 除了这种**阈值触发(`threshold`)**,还有一种**溢出恢复触发(`overflow`)**——当一次模型请求因为上下文实际超限被 Provider 直接拒绝时,pi 会先压缩再重试这次请求（`willRetry` 参数标记这种场景）。两种触发对应 `session_before_compact`/`session_compact` 事件里的 `reason` 字段（`"manual" | "threshold" | "overflow"`）,`"manual"` 对应用户主动执行 `/compact`。
 
+> **新进展**：除了这个挂在 `turn_end` 之后的 `_checkCompaction`,`agent-session.ts` 现在还在 `prepareNextTurn` 钩子（第一篇订正过的、发生在"确定要继续、下一轮真正开始之前"的那个时机)里加了第二道保险——`_compactBeforeNextAssistantResponse`。它用更便宜的 `estimateContextTokens` 对即将发出的下一轮上下文再做一次 `shouldCompact` 判定,专门覆盖"上一轮拿到的是错误响应或全零 `usage`,导致 `_checkCompaction` 没能在 `turn_end` 时刻正确判断,但攒到下一轮请求前上下文实际已经超限"这类边界情况(对应仓库里 `8328-zero-usage-auto-compaction` 这个回归测试)。两道检查触发的都是同一个 `_runAutoCompaction`,只是 `reason` 分别标记为 `"threshold"`。
+
 ### 裁剪点算法:`findCutPoint`
 
 压缩要回答的核心问题是"从哪里切一刀,切之前的历史拿去总结,切之后的原样保留"。`findCutPoint` 的算法是**从最新消息往前累加 token 估算值,一旦达到 `keepRecentTokens` 就在该处附近找一个合法的切点**：
@@ -192,6 +194,8 @@ if (isSplitTurn && turnPrefixMessages.length > 0) {
 
 这样处理有两个目的：一是防止模型把"待总结的历史"误认成"需要继续的对话"而直接续写下去（`SUMMARIZATION_SYSTEM_PROMPT` 也明确写了"Do NOT continue the conversation"）;二是把工具结果截断到 2000 字符,因为 `read`/`bash` 之类工具的输出往往是历史中体积最大的部分,不加控制会让摘要请求本身也超预算。
 
+> **订正（对照当前源码）**：早期实现里,只有 `stopReason === "error"` 才会让 `generateSummaryWithUsage` 抛出"Summarization failed"；如果生成因为撞到 `maxTokens` 上限而以 `stopReason === "length"` 收尾,响应里的文本是**不完整的**,却会被当作正常摘要直接落盘成一个压缩检查点。当前实现新增了 `getSummarizationFailure()`：只要 `stopReason` 是 `"error"` 或 `"length"` 都视为失败并抛错（后者的报错信息明确写"generation hit the token cap and the summary is incomplete"),同时还会检查响应里是否包含 `toolCall` 内容块——如果模型在"总结"这个任务里意外发起了工具调用,同样视为失败,而不是把一个不完整或语义错误的结果悄悄写进会话树,污染后续所有基于这份摘要的上下文。
+
 ### 文件操作的累积追踪
 
 压缩和分支摘要都会额外提取"这段历史里读过哪些文件、改过哪些文件",并且是**跨多次压缩累积**的：
@@ -288,6 +292,8 @@ pi.on("session_before_compact", async (event) => {
 ```
 
 `session_before_tree` 是分支摘要的对应事件,结构类似,同样可以 `{ cancel: true }` 或者提供自定义 `summary`。这两个事件是第六篇要系统讲的扩展点体系里,与本篇内容直接呼应的两个具体案例。
+
+> **新进展**：扩展体系里新增了一个 `session_compact_failed` 事件,在一次压缩**失败或被中止**时触发(区别于压缩成功后触发的 `session_compact`)。它携带触发压缩的原始 `reason`（`"manual" | "threshold" | "overflow"`)、错误文本、是否是被主动中止、以及 `willRetry`（overflow 恢复场景下,这次失败是否意味着原本要重试的那一轮也会跟着失败)和 `fromExtension`（失败的摘要内容是不是由 `session_before_compact` 钩子提供的自定义结果,而不是 pi 内置逻辑生成的)。这让扩展可以对"压缩失败"这个此前只在内部日志里能看到的情况做出响应——比如弹出提示、上报遥测、或者在自定义摘要生成失败时给用户一个明确反馈,而不是让上下文静默地继续膨胀下去。
 
 ### `CompactionEntry` 与 `retainedTail`
 

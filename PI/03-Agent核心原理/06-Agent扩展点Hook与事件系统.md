@@ -87,10 +87,17 @@ export interface ExtensionAPI {
 	): void;
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
 	registerShortcut(shortcut: KeyId, options: { description?: string; handler: (ctx: ExtensionContext) => Promise<void> | void }): void;
-	registerFlag(name: string, options: { description?: string; type: "boolean" | "string"; default?: boolean | string }): void;
+	registerFlag(
+		name: string,
+		options:
+			| { description?: string; type: "boolean"; default?: boolean }
+			| { description?: string; type: "string"; default?: string },
+	): void;
 	getFlag(name: string): boolean | string | undefined;
 }
 ```
+
+> **订正（对照当前源码）**：`registerFlag` 的 `options` 从早期一个"扁平对象"签名,改成了按 `type` 判别的联合类型——`type: "boolean"` 分支的 `default` 只能是 `boolean`,`type: "string"` 分支的 `default` 只能是 `string`。这堵住了早期签名里"声明 `type: "boolean"` 却传一个字符串 `default`"这种在类型层面本该被拒绝、却因为签名过于宽松而被放行的错误。
 
 而每个事件处理函数的第二个参数 `ctx: ExtensionContext` 是"运行时快照"——包含 `ctx.ui`（弹窗、通知、状态栏)、`ctx.sessionManager`（只读会话访问,详见第四篇)、`ctx.model`/`ctx.thinkingLevel`、`ctx.signal`（当前轮次的中止信号,详见第三篇)、`ctx.cwd`、`ctx.mode`（`"tui" | "rpc" | "json" | "print"`)等。命令处理函数额外拿到 `ExtensionCommandContext`,多出 `ctx.newSession()`/`ctx.fork()`/`ctx.navigateTree()`/`ctx.waitForIdle()` 等只能在命令里安全调用的方法——文档特别强调这些方法不能放进事件处理器里调用,因为可能造成死锁。
 
@@ -226,6 +233,13 @@ pi.registerTool({
 |`input`|`{ action: "continue" \| "transform" \| "handled", ... }`|拦截、改写或完全接管用户输入|
 
 这张表覆盖了绝大多数扩展开发的常见需求入口,和第一至五篇讲过的引擎机制逐一对应：`tool_call`/`tool_result` 对应第二篇的工具调用流水线,`before_agent_start`/`context` 对应第三篇的消息状态机,`session_before_compact` 对应第五篇的压缩流程。
+
+> **新进展**：事件目录里新增了几个值得关注的成员：
+>
+> - `session_compact_failed`：压缩失败或被中止时触发,与成功时触发的 `session_compact` 相对,携带 `reason`（`manual`/`threshold`/`overflow`)、`errorMessage`、`aborted`、`willRetry`、`fromExtension` 等字段(详见第五篇的更新)。
+> - `ui_prompt_start`/`ui_prompt_end`：当 pi 开始/结束等待一个阻塞式的、面向用户的扩展 UI 交互（`kind` 为 `"select" | "confirm" | "input" | "editor" | "custom"`)时触发。这给了扩展和上层 UI 一个通用信号——"当前不是 agent 在思考或执行工具,而是在等某个扩展弹出的对话框被用户处理",可以用来驱动"正在等待用户输入"这类状态指示,而不需要每个扩展自己维护重复的等待态展示逻辑。
+
+
 
 ## 关键代码解读
 

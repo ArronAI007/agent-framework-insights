@@ -23,30 +23,38 @@ Pi 内置了多个模型来源的支持，认证方式分两大类。
 - GitHub Copilot —— 登录时对 github.com 直接回车，或输入企业版 Server 域名；若提示"model not supported"，需要先在 VS Code 的 Copilot Chat 模型选择器里手动为该模型点击 "Enable"
 - xAI（Grok/X 订阅）—— 运行 `/login xai` 后选择 "Use a subscription"；也可以选 "Use an API key" 走 `XAI_API_KEY`
 - OpenRouter —— 运行 `/login openrouter` 走 PKCE 授权流程，会生成一个由你自己掌控、从 OpenRouter 账户余额扣费的 API Key；在 SSH 等无法回环访问本地端口的远程环境下，需要手动把跳转 URL 或授权码粘贴进登录提示
-- Radius —— 一种动态的 `pi-messages` 网关，`/login radius` 会把 OAuth token 存进 `auth.json`，模型目录独立刷新并缓存在 `models-store.json`
+- Radius —— 一种动态的 `pi-messages` 网关，`/login radius` 会把 OAuth token 存进 `auth.json`，模型目录独立刷新并缓存在 `models-store.json`；也可以用 `RADIUS_API_KEY` 走纯 API Key 认证
+- Amazon Bedrock —— `/login amazon-bedrock` 可以直接存一个 Bedrock API Key，作为下文「AWS Profile / IAM Key / Bearer Token」几种环境变量方式之外的另一个入口
 
 `/logout` 清除凭证。所有 token 存放在 `~/.pi/agent/auth.json`，过期自动刷新（OpenRouter 例外，它生成的是不会自动过期的用户自控密钥）。
 
 ### API Key 认证
 
-Pi 支持的 API Key provider 数量相当庞大，覆盖主流云厂商和一大批国内外模型服务。下面摘录部分核心条目（完整列表以 [`packages/ai/src/env-api-keys.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/env-api-keys.ts) 为准）：
+Pi 支持的 API Key provider 数量相当庞大，覆盖主流云厂商和一大批国内外模型服务。下面摘录部分核心条目（完整列表以 [`packages/ai/src/env-api-keys.ts`](https://github.com/earendil-works/pi/blob/main/packages/ai/src/env-api-keys.ts) 为准）：
 
 | Provider | 环境变量 | `auth.json` 键 |
 |----------|----------|------------------|
 | Anthropic | `ANTHROPIC_API_KEY` | `anthropic` |
+| Ant Ling | `ANT_LING_API_KEY` | `ant-ling` |
+| Azure OpenAI Responses | `AZURE_OPENAI_API_KEY` | `azure-openai-responses` |
 | OpenAI | `OPENAI_API_KEY` | `openai` |
 | DeepSeek | `DEEPSEEK_API_KEY` | `deepseek` |
+| NVIDIA NIM | `NVIDIA_API_KEY` | `nvidia` |
 | Google Gemini | `GEMINI_API_KEY` | `google` |
 | Amazon Bedrock | `AWS_BEARER_TOKEN_BEDROCK` | `amazon-bedrock` |
 | Mistral | `MISTRAL_API_KEY` | `mistral` |
 | Groq | `GROQ_API_KEY` | `groq` |
 | Cerebras | `CEREBRAS_API_KEY` | `cerebras` |
+| Cloudflare AI Gateway / Workers AI | `CLOUDFLARE_API_KEY`（+ `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_GATEWAY_ID`） | `cloudflare-ai-gateway` / `cloudflare-workers-ai` |
 | xAI | `XAI_API_KEY` | `xai` |
 | OpenRouter | `OPENROUTER_API_KEY` | `openrouter` |
 | Vercel AI Gateway | `AI_GATEWAY_API_KEY` | `vercel-ai-gateway` |
+| Radius | `RADIUS_API_KEY` | `radius` |
 | Hugging Face | `HF_TOKEN` | `huggingface` |
 | Fireworks / Together AI / Baseten | `FIREWORKS_API_KEY` / `TOGETHER_API_KEY` / `BASETEN_API_KEY` | 对应键名 |
-| 智谱 ZAI（国际/国内两版）、MiniMax（国际/国内）、Qwen Token Plan（国际/个人版/国内）、小米 MiMo 等 | 各自专属环境变量 | 各自专属键名 |
+| Kimi For Coding | `KIMI_API_KEY` | `kimi-coding` |
+| OpenCode Zen / OpenCode Go | `OPENCODE_API_KEY` | `opencode` / `opencode-go` |
+| 智谱 ZAI（国际/国内两版）、MiniMax（国际/国内）、Qwen Token Plan（国际现有目录/个人版/国内）、小米 MiMo（含国内/阿姆斯特丹/新加坡三个 Token Plan 分区）等 | 各自专属环境变量 | 各自专属键名 |
 
 使用方式同样是启动前设置环境变量：
 
@@ -161,7 +169,12 @@ Pi 支持的 `api` 类型（决定用哪种流式协议解析响应）：
 
 当 `models.json` 的声明式配置不够用——比如需要自定义鉴权流程、非标准流式协议、动态发现模型列表——就需要写一个扩展（Extension，Pi 用 TypeScript 编写的插件模块），通过 `pi.registerProvider()` 注册。
 
-最简单的场景是给已有 provider 换个 baseUrl 或加请求头（走代理）：
+`pi.registerProvider()` 现在支持两种写法：
+
+- **"传统"配置式写法**（`pi.registerProvider(name, config)`）：只传一个 provider ID 和一份配置对象，适合换代理地址、加请求头这类简单场景，下文示例大多采用这种写法；
+- **完整 Provider 写法**（`pi.registerProvider(createProvider({...}))`）：通过 `@earendil-works/pi-ai` 提供的 `createProvider()` 和 `openAICompletionsApi()` 等 API 构造一个完整的 pi-ai `Provider` 对象，可以精细控制鉴权（`auth.apiKey.login`/`resolve`）、模型过滤、凭证刷新和流式解析逻辑,适合需要自定义登录交互或非标准协议的复杂场景。
+
+最简单的场景是给已有 provider 换个 baseUrl 或加请求头（走代理），这种情况用"传统"写法就够了：
 
 ```typescript
 pi.registerProvider("anthropic", {

@@ -108,6 +108,8 @@ export default async function (pi: ExtensionAPI) {
 
 **重要**：扩展工厂可能在"根本不会启动会话"的调用中也被执行一次，所以**不要**在工厂函数体里直接启动后台资源（进程、socket、文件监听、定时器）。把这些放到 `session_start` 事件或真正用到该资源的命令/工具/事件处理器里，并注册一个幂等的 `session_shutdown` 处理器来关闭会话级资源。
 
+**工厂函数如果抛异常，这次加载会被整体回滚**：如果一个扩展的工厂函数在执行到一半时（同步或异步）抛出异常，pi 会丢弃它在本次工厂调用期间做过的所有注册——包括已经调用过的 `pi.registerProvider()`/`pi.registerTool()`/`pi.registerFlag()` 等——并把这个扩展标记为加载失败，而不是让"注册了一半"的扩展带着不完整的状态继续参与运行。这意味着你不需要在工厂函数里手写 try/catch 去手动撤销之前几行已经生效的注册；只要工厂函数在检测到致命问题时直接 `throw`，pi 就会保证不会遗留半成品状态。
+
 ## 注册工具：`pi.registerTool()`
 
 自定义工具通过 `pi.registerTool()` 注册，字段结构和内置工具的 `ToolDefinition` 是同一套体系。最小示例（改编自 `examples/extensions/hello.ts`）：
@@ -145,6 +147,7 @@ export default function (pi: ExtensionAPI) {
 - **`prepareArguments(args)`**：在 schema 校验之前运行的兼容层，用来把历史上不同形状的参数统一成当前 schema 认可的样子（例如恢复一个存有旧版工具调用参数的历史会话时）。不要为了兼容旧格式而放松公开的 `parameters` schema 本身。
 - **`StringEnum`**：字符串枚举请用 `@earendil-works/pi-ai` 提供的 `StringEnum`，而不是 `Type.Union`/`Type.Literal`——后者与 Google 的 API 不兼容。
 - **报错方式**：要把一次工具执行标记为失败（`isError: true`），必须在 `execute` 里 `throw`；`return` 一个值永远不会被视为错误，不管返回对象里塞了什么字段。
+- **`parameters` schema 会在注册时就被校验**：格式不合法的 JSON Schema（比如字段类型写错）会在 `pi.registerTool()` 调用时直接被拒绝并报错，而不是留到真正发请求给 Provider 时才因为序列化失败而报出一个更难定位的错误——这是为了让"写错 schema"这类问题尽早暴露。
 
 ### 自定义工具如果要改文件：必须用 `withFileMutationQueue`
 
@@ -172,7 +175,7 @@ async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 
 ### 覆盖内置工具
 
-扩展可以注册一个与内置工具同名（`read`/`bash`/`edit`/`write`/`grep`/`find`/`ls`）的工具来整体替换它，交互模式下会显示一条警告提示这一覆盖行为发生了。典型用途是给 `read` 加访问日志或权限控制（参考 `examples/extensions/tool-override.ts`）。
+扩展可以注册一个与内置工具同名（`read`/`bash`/`powershell`/`edit`/`write`/`grep`/`find`/`ls`，`powershell` 是第一篇提到的第八个内置工具）的工具来整体替换它，交互模式下会显示一条警告提示这一覆盖行为发生了。典型用途是给 `read` 加访问日志或权限控制（参考 `examples/extensions/tool-override.ts`）。
 
 ## 监听与拦截事件：`pi.on()`
 
@@ -194,7 +197,7 @@ pi.on("tool_call", async (event, ctx) => {
 
 `event.input` 是可变的，原地修改会真正影响工具执行；返回 `{ block: true, reason?, terminate? }` 可以阻止这次调用（`terminate` 只在被阻止时生效，且只有当同一批次里所有已完成的工具结果都要求终止时，Agent 才会提前停止）。
 
-其他常用事件：`session_start`（会话启动，适合做状态恢复）、`tool_result`（工具执行完成后，可以链式修改结果）、`user_bash`（用户输入 `!command` 时触发，可以整体替换执行后端）、`input`（用户输入到达时，在 skill/模板展开之前，可以 transform 或直接 handled）。`examples/extensions/confirm-destructive.ts` 展示了如何用 `session_before_switch`/`session_before_fork` 加确认弹窗：
+其他常用事件：`session_start`（会话启动，适合做状态恢复）、`tool_result`（工具执行完成后，可以链式修改结果）、`user_bash`（用户输入 `!command` 时触发，可以整体替换执行后端）、`input`（用户输入到达时，在 skill/模板展开之前，可以 transform 或直接 handled）、`session_compact`/`session_compact_failed`（压缩成功/失败或被中止时触发，后者带 `errorMessage`/`aborted`/`fromExtension` 字段，方便扩展区分"用户主动取消压缩"和"压缩本身报错"两种情况）、`ui_prompt_start`/`ui_prompt_end`（`ctx.ui.select()`/`confirm()`/`input()`/`editor()`/`custom()` 弹出交互提示时触发的纯通知事件，用于让宿主状态栏之类的集成显示"正在等待用户输入"而不是"正在运行"；多个提示嵌套或重叠时会被合并成一个外层的等待区间）。`examples/extensions/confirm-destructive.ts` 展示了如何用 `session_before_switch`/`session_before_fork` 加确认弹窗：
 
 ```typescript
 pi.on("session_before_switch", async (event, ctx) => {
@@ -205,6 +208,24 @@ pi.on("session_before_switch", async (event, ctx) => {
   }
 });
 ```
+
+## 让扩展自己发起模型请求：`ctx.modelRegistry.streamSimple()` / `stream()`
+
+有些扩展不满足于"拦截/修改一次已有的工具调用"，而是想自己主动发起一次 LLM 请求——比如用一个便宜模型做输入预处理、或者在后台调用模型生成一段摘要。`ExtensionContext` 上的 `ctx.modelRegistry` 直接暴露了这两个方法：
+
+```typescript
+pi.on("tool_result", async (event, ctx) => {
+  const model = ctx.modelRegistry.find("anthropic", "claude-haiku-4-5");
+  if (!model) return;
+  const events = ctx.modelRegistry.streamSimple(model, { messages: [...] }, { reasoning: "low" });
+  for await (const e of events) {
+    if (e.type === "text_delta") { /* 增量处理 */ }
+  }
+  const finalMessage = await events.result();
+});
+```
+
+`streamSimple()` 对应上一章讲的"跨厂商统一推理等级"接口（用 `reasoning` 这一个字段控制强度），`stream()` 则暴露某个具体 API 的专属参数。两者的关键价值在于：它们会使用当前会话里**已经配置好的** Provider 和已解析的鉴权，包括扩展自己用 `pi.registerProvider()` 注册的自定义 Provider——而 `@earendil-works/pi-ai/compat` 里的历史全局 `stream()`/`complete()` 函数看不到扩展注册的 Provider，只认内置目录。所以扩展内部要发起模型调用时，应该用 `ctx.modelRegistry` 这两个方法，而不是直接从 `pi-ai` 里 import 兼容层的流式函数。两个方法都返回上一章讲过的 `AssistantMessageEventStream`：可以直接 `for await` 消费增量事件，也可以 `await stream.result()` 拿最终的 `AssistantMessage`；如果模型解析或鉴权失败，会通过 `error` 事件和 `result()` 的错误结果暴露出来，而不是抛异常中断扩展本身。
 
 ## 注册命令：`pi.registerCommand()`
 

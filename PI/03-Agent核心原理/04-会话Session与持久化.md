@@ -196,6 +196,8 @@ _persist(entry: SessionEntry): void {
 
 如果只想保留"从根到某个叶子"这一条路径、丢掉其余分支,`createBranchedSession(leafId)` 会构造一个全新的会话文件：先用 `getBranch(leafId)` 拿到路径,过滤掉 `LabelEntry`（并重新串联 `parentId`,避免断链导致后续依赖某个标签节点的条目变成孤儿）,再把落在这条路径上的用户标签重新以标签条目的形式追加进去。这是 `/fork`（保留全部历史另起一个会话）与"提取单一分支"操作背后的核心实现。
 
+> **订正（对照当前源码）**：`createBranchedSession` 剔除 `LabelEntry` 时,如果被剔除的标签节点恰好是某条 `CompactionEntry.firstKeptEntryId` 指向的对象,重新串联 `parentId` 之后原先的引用会失效。当前实现用一个 `replacementByLabelId` 映射记录"每个被跳过的标签,应该被路径上紧随其后的哪个真实条目替换",导出新会话时顺带把 `firstKeptEntryId` 重写为替换后的 id,避免压缩边界因为标签被剥离而指向一个根本不存在于新文件里的节点。
+
 ### 会话发现与列表:`findMostRecentSession` / `SessionManager.list`
 
 `--resume`（继续最近会话）依赖 `findMostRecentSession`,它只读取每个候选文件的**头部**（`readSessionHeader`,带 `MAX_SESSION_HEADER_SCAN_BYTES` 上限的有界扫描,避免遇到超大或损坏文件时无限读取）来判断 `cwd` 是否匹配,而不需要把整份文件解析完——这对有大量历史会话的用户是重要的性能优化。列表展示（`SessionManager.list`/`listAll`）则用 `buildSessionInfosWithConcurrency` 做了并发上限为 10 的并发加载,避免同时打开成百上千个文件句柄。
@@ -240,6 +242,15 @@ _persist(entry: SessionEntry): void {
 ## 小结与思考题
 
 会话持久化的核心心智模型是：**用 JSONL 存一棵以 `id`/`parentId` 连接的树,`leafId` 是当前位置的指针,`branch()`/`branchWithSummary()` 通过挪动指针实现零成本的历史保留式回退,`buildContextEntries`/`buildSessionContext` 负责把"从根到叶子的一条路径"结合压缩信息投影成真正发给 LLM 的消息列表**。落盘策略上,`SessionManager` 用"延迟到第一条 assistant 消息出现"的策略避免产生空壳会话文件。
+
+> **新进展**：`packages/agent/src/harness/session/` 里出现了一套面向"下一代引擎"（`AgentHarness`，见第一篇末尾)的会话模型,与本篇描述的 `session-manager.ts` 并行存在，尚未替换它：
+>
+> - 条目类型被精简为四种——`message`/`compaction`/`branch_summary`/`custom`（去掉了 `model_change`/`thinking_level_change`/`label`/`session_info`/`custom_message` 等本篇提到的元数据类专用类型,这些信息改为通过其他机制表达)。
+> - 存储后端被抽象成 `SessionRepo`/`Storage` 接口,默认实现仍是 JSONL（`harness/session/jsonl/`),但新增了一个独立发布的 `packages/session-backends/sqlite-node` 包,提供符合同一套接口的 SQLite 实现——这意味着未来 pi 的会话持久化理论上可以从"每个会话一个 JSONL 文件"切换到"一个 SQLite 数据库存所有会话",而调用方代码基本不用变。
+> - 新增了显式的 `fork.ts`/`fork-policy.ts`,把"分支"从 `session-manager.ts` 里 `branch()`/`branchWithSummary()` 这样的方法调用,提升成了引擎原生支持、可配置策略的一等操作。
+> - `harness/session/testing/` 下有一套"conformance"测试套件（`testing/conformance/session-repo.ts`、`testing/conformance/storage.ts`),任何新的存储后端实现（比如未来可能出现的其他数据库后端)都要跑同一套一致性测试,这也是 git 历史里"session repo conformance by capability"一系列提交的来源——按后端能力（是否支持并发写、是否支持事务等)分级校验,而不是要求所有后端都实现全部能力。
+>
+> 截至本课程更新时,这套新会话模型主要被 `AgentHarness` 自身、其测试和 benchmark 使用,`packages/coding-agent` 的交互式 `SessionManager` 尚未迁移过去,本篇对 JSONL 树形模型的描述对当前默认行为仍然完全适用。
 
 思考题：
 

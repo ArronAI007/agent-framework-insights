@@ -245,7 +245,27 @@ const { session } = await createAgentSession({
 
 鉴权解析优先级由 `ModelRuntime` 处理，依次是：运行时覆盖（`setRuntimeApiKey`，不落盘）→ `auth.json` 里存储的凭证 → 环境变量（`ANTHROPIC_API_KEY` 等）→ 针对 `models.json` 自定义 provider 的兜底解析器。
 
-**工具**：内置工具名为 `read`/`bash`/`edit`/`write`/`grep`/`find`/`ls`，默认启用前四个；`noTools: "all"` 关闭全部工具，`noTools: "builtin"` 只关闭默认内置工具（扩展和自定义工具仍启用）；`excludeTools` 在 `tools` 白名单之后再排除指定工具名。也可以用 `defineTool()` 定义自定义工具：
+`ModelRuntime.create()` 默认只从本地缓存恢复模型目录（catalog），不会主动联网刷新；远程目录会持久化到本地（默认 `~/.pi/agent/models-store.json`，可用 `modelsStorePath` 改路径，或注入自定义 `modelsStore` 接管持久化），网络刷新默认每个 provider 每 4 小时最多一次，除非强制。想在创建时就联网刷新并限定超时，可以传：
+
+```typescript
+const refreshedRuntime = await ModelRuntime.create({
+  allowModelNetwork: true,
+  modelRefreshTimeoutMs: 15_000,
+});
+```
+
+需要立即强制刷新时调用 `await modelRuntime.refresh({ allowNetwork: true, force: true, signal })`；设置环境变量 `PI_OFFLINE` 则会完全禁止模型相关的网络访问——这对离线开发环境或测试环境是有用的兜底开关。
+
+**工具**：内置工具名为 `read`/`bash`/`powershell`/`edit`/`write`/`grep`/`find`/`ls`，默认启用 `read`/`bash`/`edit`/`write` 四个；`powershell` 是较新加入的可选内置工具（`createPowerShellTool`），用于在 Windows 上用 PowerShell 替代 Bash 执行命令：
+
+```typescript
+// 在 Windows 上用 PowerShell 代替 Bash
+const { session } = await createAgentSession({
+  tools: ["read", "powershell", "edit", "write"],
+});
+```
+
+`noTools: "all"` 关闭全部工具，`noTools: "builtin"` 只关闭默认内置工具（扩展和自定义工具仍启用）；`excludeTools` 在 `tools` 白名单之后再排除指定工具名。也可以用 `defineTool()` 定义自定义工具：
 
 ```typescript
 import { Type } from "typebox";
@@ -304,7 +324,14 @@ const { session: continued, modelFallbackMessage } = await createAgentSession({
 
 // 打开指定会话文件
 const { session: opened } = await createAgentSession({ sessionManager: SessionManager.open("/path/to/session.jsonl") });
+
+// 续接一个存储在文件系统之外（比如数据库）的会话：把原始 entries 一并传入
+const { session: restored } = await createAgentSession({
+  sessionManager: SessionManager.inMemory(process.cwd(), { id: sessionId }, entries),
+});
 ```
+
+`SessionManager.inMemory()` 现在可以接收一组已有的 `entries`（连同可选的 `SessionHeader`）作为起点，而不仅仅是空白起步——这是为了支持"会话内容保存在外部存储（数据库等），需要恢复到内存里继续对话"这种场景：直接重放 `appendMessage`/`appendCompaction` 做不到这一点，因为重放会重新生成 id、重写时间戳，分支相关的 `firstKeptEntryId`/`targetId`/`fromId` 也都要重新映射；而把原始 entries 直接"采纳"进来则保留了原有的 id 和分支结构。如果传入的 entries 带着原始 `SessionHeader`（包含版本号），恢复时会按该版本号执行必要的迁移；不带 header 则会被当作当前版本的数据直接采纳。
 
 `SessionManager` 还暴露了一套树遍历 API：`getEntries()`（不含头部的全部条目）、`getTree()`（完整树结构）、`getPath()`（根到当前叶子的路径）、`getLeafEntry()`、`getChildren(id)`，以及 `branch(entryId)` / `branchWithSummary(id, "...")` / `createBranchedSession(leafId)` 这类分支操作。这套设计和 RPC 协议里 `fork`/`clone`/`get_tree`/`get_entries` 命令是一一对应的——RPC 命令本质上就是把这些 SDK 能力包了一层 JSON 协议的壳。
 

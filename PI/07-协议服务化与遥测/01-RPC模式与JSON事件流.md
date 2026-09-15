@@ -117,6 +117,19 @@ RPC 命令按功能大致分为几组（完整定义在 `packages/coding-agent/s
 
 **会话管理**：`get_session_stats`、`export_html`、`switch_session`、`fork`、`clone`、`get_fork_messages`、`get_entries`（可用 `since` 游标增量拉取，支持跨客户端重启续传）、`get_tree`、`get_last_assistant_text`、`set_session_name`。
 
+**队列清空**：`clear_queue` 移除当前排队中的插话（steering）和跟进（follow-up）消息，并把被移除的文本原样返回：
+
+```json
+{"type": "clear_queue"}
+```
+
+```json
+{"type": "response", "command": "clear_queue", "success": true,
+ "data": {"steering": ["Change direction"], "followUp": ["Summarize when finished"]}}
+```
+
+这个命令是为了支持"交互式 Esc 中断"这类体验：客户端在发 `abort` 之前先发 `clear_queue`，把返回的文本放回本地编辑器，让用户可以直接编辑后重新发送，而不是让这些排队消息随着 `abort` 一起被悄悄丢弃——因为 `abort` 本身如果会话里还残留排队消息，是会继续处理它们的，`clear_queue` 给了客户端一个"先拿回文本、再决定要不要中止"的机会。
+
 **命令发现**：`get_commands`，列出可以通过 `/name` 语法在 `prompt` 里调用的扩展命令、Prompt 模板和技能（skill）。
 
 一个具体例子，发送提示词：

@@ -44,7 +44,8 @@ Pi 的交互界面（TUI，Terminal UI）由四个区域组成：
 |------|------|
 | `/login`、`/logout` | 管理 OAuth 或 API Key 凭证 |
 | `/llama` | 下载、加载、卸载 llama.cpp 路由模型 |
-| `/model` | 切换模型 |
+| `/model` | 切换模型；在选择器里按 `Ctrl+S` 可把当前选中的模型保存为启动默认值 |
+| `/thinking` | 切换 thinking level；同样支持 `Ctrl+S` 保存为启动默认值 |
 | `/scoped-models` | 启用/禁用参与 Ctrl+P 循环切换的模型集合 |
 | `/settings` | 调整 thinking level、主题、消息投递方式、传输协议等 |
 | `/resume` | 从历史会话中选择一个恢复 |
@@ -165,7 +166,7 @@ pi config                    # 启用/禁用包资源
 | `--no-builtin-tools`, `-nbt` | 禁用内置工具，保留扩展/自定义工具 |
 | `--no-tools`, `-nt` | 禁用全部工具 |
 
-内置工具共 7 个：`read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`。
+内置工具共 8 个：`read`、`bash`、`powershell`（Windows 平台专属，见《01-安装指南》）、`edit`、`write`、`grep`、`find`、`ls`。
 
 ### 资源选项
 
@@ -194,9 +195,11 @@ pi --no-extensions -e ./my-extension.ts
 | `--system-prompt <text>` | 替换默认系统提示词（上下文文件和 Skills 仍会追加） |
 | `--append-system-prompt <text>` | 在默认系统提示词后追加内容 |
 | `--tui-mode <mode>` | TUI 模式：`regular`（默认）或实验性的 `fullscreen` |
+| `--use-theme <name[/name]>` | 仅为本次运行设置初始主题，不修改已保存的设置；写成 `亮色/暗色` 形式（如 `light/dark`）可跟随终端明暗自动选择 |
 | `--verbose` | 强制显示详细启动信息 |
 | `-a`, `--approve` | 本次运行信任项目本地文件 |
 | `-na`, `--no-approve` | 本次运行忽略项目本地文件 |
+| `--` | 停止解析选项，之后的参数一律当作 prompt 或 `@file` 输入（用于传递以 `-` 开头的提示词） |
 | `-h`, `--help` | 显示帮助 |
 | `-v`, `--version` | 显示版本号 |
 
@@ -218,6 +221,9 @@ pi "List all .ts files in src/"
 
 # 一次性非交互调用
 pi -p "Summarize this codebase"
+
+# 提示词以 - 开头时，用 -- 显式结束选项解析
+pi -p -- "- Summarize these points"
 
 # 非交互模式配合管道输入
 cat README.md | pi -p "Summarize this text"

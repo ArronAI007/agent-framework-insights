@@ -117,7 +117,10 @@ Rules:
 - Use the faux provider from `packages/ai/src/providers/faux.ts`
 - Do not use real provider APIs, real API keys, network calls, or paid tokens
 - Keep these tests CI-safe and deterministic
+- Do not use or extend the legacy `test/test-harness.ts` path unless a missing capability forces it
 ```
+
+最后一条是后来补的：仓库里还留着一条更老的测试脚手架路径 `test/test-harness.ts`，明确要求新测试不要再用它、也不要继续扩展它，除非 `test/suite/harness.ts` 确实缺了某个能力——这是一条典型的"只留退路、不鼓励使用"式迁移提示，说明 `test/suite/` 这套基于 faux provider 的脚手架是当前唯一被官方推荐的写法。
 
 也就是说，任何要测试 `AgentSession`（对话生命周期、工具调用、压缩、扩展等）行为的新测试，一律不允许接触真实的模型 API，而要用 faux provider 模拟一个"听话的假模型"。
 
@@ -298,21 +301,34 @@ const extensionHarnessTable = evalHarnessTable("Pi extension authoring system pr
 
 这正是"评测 Agent 行为质量"和"传统断言式单元测试"的本质区别：单元测试问的是"这段代码是否符合规格"，是非黑即白的；evals 问的是"这套提示词/工具/模型的组合，在真实模型的不确定性下，完成任务的成功率有多高"，是概率性的、需要用对照组和评分机制来衡量的。`README.md` 里也明确建议对照实验类的 eval 把 `judgeThreshold: null`，让低分只作为观察记录而不直接判失败——因为真实模型输出本身就有波动。
 
-`packages/evals/vitest.config.ts` 和 `packages/evals/vitest.test.config.ts` 是两份不同配置：前者用于跑真正的 eval 任务（`npm run eval`），后者用于跑 evals 这个包自身基础设施代码的单元测试（`npm run test`，验证 `harness-table.ts`、`summary.ts`、`artifacts.ts` 这些工具函数本身没写错）——这两者不要混淆：一个是"用 evals 评测 pi"，一个是"测试 evals 工具本身"。
+### `docs.eval.ts`：让真实 Agent 自己审计文档是否与实现一致
 
-## 五、回归测试的组织约定
+`packages/evals/src/` 后来新增了一个很有意思的 eval：`docs.eval.ts`。它用 `globSync("**/*.md", { cwd: docsRoot })` 扫出 `packages/coding-agent/docs/` 下的每一篇文档，对每一篇都跑一次真实的 `AgentSession`，让 Agent 自己去读文档内容、再用 `read`/`grep`/`find`/`ls` 这几个只读工具去翻源码，最后调用一个专门定义的 `submit_documentation_audit` 工具提交结构化的审计结论（`verdict: "match" | "mismatch"`，附带文档证据和实现证据）：
 
-`packages/coding-agent/test/suite/README.md` 对回归测试（regression test，即"针对某个已报告的具体 bug 补的测试"）给出了明确约定：
-
-```text
-Organization:
-- Put broad lifecycle and characterization tests directly under `test/suite/`
-- Put issue-specific regression tests under `test/suite/regressions/`
-- Name regression tests as `<issue-number>-<short-slug>.test.ts`
-- Example: `test/suite/regressions/2023-queued-slash-command-followup.test.ts`
+```ts
+const submitDocumentationAuditTool = defineTool({
+	name: "submit_documentation_audit",
+	description: "Submit the final verdict after completing the documentation investigation.",
+	parameters: Type.Object({
+		verdict: Type.Union([Type.Literal("match"), Type.Literal("mismatch")]),
+		explanation: Type.String({ minLength: 1, maxLength: 2000 }),
+		documentationEvidence: Type.String({ minLength: 1, maxLength: 2000 }),
+		implementationEvidence: Type.String({ minLength: 1, maxLength: 3000 }),
+	}, { additionalProperties: false }),
+	constrainedSampling: { type: "json_schema", strict: "prefer" },
+	// ...
+});
 ```
 
-翻开 `test/suite/regressions/` 目录，可以看到这条约定被严格执行，文件名清一色是 `<issue 编号>-<简短描述>.test.ts` 的格式，例如：
+这是一个跳出"人写断言、代码跑断言"传统思路的用法：与其靠人工 review 保证文档不过时,不如让 Agent 本身（既然它就是要去读这些文档来理解自己怎么用）充当审计员，用它自己的阅读理解能力去比对"文档说的"和"代码实际做的"是否一致，再用一个 `constrainedSampling: { type: "json_schema" }` 的自定义工具强制它输出结构化、可编程消费的结论,而不是一段自由文本。这也解释了本课程前面几篇为什么反复强调"文档描述在快速迭代的仓库里容易和实现脱节"——pi 项目自己也在用 evals 这套基础设施来对抗这个问题。
+
+`packages/evals/vitest.config.ts` 和 `packages/evals/vitest.test.config.ts` 是两份不同配置：前者用于跑真正的 eval 任务（`npm run eval`），后者用于跑 evals 这个包自身基础设施代码的单元测试（`npm run test`，验证 `harness-table.ts`、`summary.ts`、`artifacts.ts` 这些工具函数本身没写错）——这两者不要混淆：一个是"用 evals 评测 pi"，一个是"测试 evals 工具本身"。
+
+## 五、回归测试的组织约定（现已从文档规则降级为约定俗成）
+
+需要更新一处认知：早期 `packages/coding-agent/test/suite/README.md` 曾用一段"Organization"明确写出回归测试的组织规则（broad 测试放 `test/suite/` 下、issue 相关的回归测试放 `test/suite/regressions/`、按 `<issue-number>-<short-slug>.test.ts` 命名），但这段规则在后续一次文档清理（`docs(coding-agent): remove issue-specific regression test placement rule`）中被从 README 里整段删除了，现在的 README 只保留了上一节列出的那几条硬性规则，不再对目录组织方式做文档层面的强制约定。
+
+不过实际代码库里的组织方式并没有变：`test/suite/regressions/` 目录依然存在，写作本文时里面仍有 70 多个测试文件，文件名依然清一色是 `<issue 编号>-<简短描述>.test.ts` 的格式，例如：
 
 ```text
 2023-queued-slash-command-followup.test.ts
@@ -321,9 +337,9 @@ Organization:
 7290-json-stream-linear.test.ts
 ```
 
-也存在个别没有编号前缀的文件（如 `pre-prompt-compaction-no-continue.test.ts`、`startup-session-rebind-duplicate-subscription.test.ts`），说明该约定的核心是"从 issue 编号能一眼追溯到问题背景"，编号是主要形式，但并非对所有回归测试都强制要求（这类没有编号的文件具体是历史遗留还是没有对应 issue，仓库文档里没有进一步说明，这里如实说明未找到确切依据）。这种命名方式的好处很直接：几年后再看到这个测试文件，不需要看测试内容就知道它在防止哪个历史 bug 复现，也能顺藤摸瓜找到当年的 issue 讨论上下文。
+也存在个别没有编号前缀的文件（如 `pre-prompt-compaction-no-continue.test.ts`、`startup-session-rebind-duplicate-subscription.test.ts`），这印证了目录组织本身现在只是约定俗成的实践,不再是文档强制的规则。这种命名方式的好处依然很直接：几年后再看到这个测试文件，不需要看测试内容就知道它在防止哪个历史 bug 复现。
 
-新增回归测试时，`AGENTS.md` 的要求是放在 `packages/coding-agent/test/suite/regressions/`，同样必须使用 `test/suite/harness.ts` 和 faux provider，不能引入真实 provider 依赖。
+当前 `AGENTS.md` 里关于回归测试的要求已经从"按固定目录 + 文件名格式组织"改成了更轻量的一句话：**"修复某个 GitHub issue 的回归测试，要在测试旁边加一条带 issue 编号的注释"**（`When regressions tests for fixing a github issue, add a comment with the github issue number next to the test.`）——从"靠文件路径和命名规范传递可追溯性"，变成"靠代码注释传递可追溯性"，约束目标没变（几年后还能顺藤摸瓜找到问题背景），但载体从文件系统约定放宽成了源码内注释,这对贡献者来说门槛更低，也不再要求新测试必须严格套进 `test/suite/regressions/` 这一个目录。当然，`test/suite/harness.ts` + faux provider、不能引入真实 provider 依赖这两条硬约束没有变化。
 
 ## 动手练习
 

@@ -37,9 +37,9 @@ pi 从以下位置加载 Skills：
 - CLI:`--skill <path>`（可重复传入，即使加了 `--no-skills` 这类显式路径依然会加载）
 
 发现细则:
-- 在 `~/.pi/agent/skills/` 和 `.pi/skills/` 里,直接放在根目录的 `.md` 文件会被当作独立技能发现;
+- 在 `~/.pi/agent/skills/` 和 `.pi/skills/` 里,直接放在根目录的 `.md` 文件只有在带有合法的 skill frontmatter（且 `description` 非空）时才会被当作独立技能发现——不满足格式要求的普通 Markdown 文件会被静默忽略,不会报错也不会被当作技能加载;
 - 所有位置里,包含 `SKILL.md` 的目录都会被递归发现;
-- 在 `~/.agents/skills/` 和项目 `.agents/skills/` 里,根目录的 `.md` 文件会被**忽略**（这是与前一条的差异点）。
+- 在 `~/.agents/skills/` 和项目 `.agents/skills/` 里,根目录的 `.md` 文件会被**忽略**,但分组子文件夹里带有合法 skill frontmatter 的**嵌套** `.md` 文件仍然会被发现（这是与前一条的差异点，也是比早期版本更宽松的一处调整）。
 
 用 `--no-skills` 可以关闭自动发现（显式传入的 `--skill` 路径仍然生效）。
 
@@ -63,7 +63,7 @@ pi 从以下位置加载 Skills：
 
 1. 启动时,pi 扫描所有 skill 位置,只提取每个技能的 `name` 和 `description`。
 2. 系统提示词里按 [规范格式](https://agentskills.io/integrate-skills) 列出所有可用技能的 XML 描述。
-3. 当任务匹配某个技能的描述时,模型会用 `read` 工具加载完整的 `SKILL.md`（模型不一定每次都会主动这么做,可以通过提示词引导,或者用户直接敲 `/skill:name` 强制加载）。
+3. 当任务匹配某个技能的描述时,模型会用 `read` 工具加载完整的 `SKILL.md`；如果当前工具集里没有 `read`（例如某些精简/受限模式只保留了 `bash`），会退化成用 `bash` 读取文件内容（模型不一定每次都会主动这么做,可以通过提示词引导,或者用户直接敲 `/skill:name` 强制加载）。
 4. 模型按 `SKILL.md` 里的指示行动,并用相对路径引用技能目录里的脚本和资源文件。
 
 这套机制被称为"渐进式披露"（progressive disclosure）：只有描述常驻上下文，完整指令按需加载，避免几十个技能的完整内容把上下文预算全部占满。
@@ -144,7 +144,7 @@ frontmatter 字段（按 [Agent Skills 规范](https://agentskills.io/specificat
 
 ### 校验规则
 
-pi 会按 Agent Skills 标准校验技能，大多数问题只警告、仍然加载：名字超过 64 字符或含非法字符、名字以连字符开头/结尾或含连续连字符、description 超过 1024 字符。未知的 frontmatter 字段会被忽略。**唯一的例外**：缺少 `description` 的技能不会被加载。不同位置出现同名技能时会警告并保留最先发现的那一个。
+pi 会按 Agent Skills 标准校验技能，大多数问题只警告、仍然加载：名字超过 64 字符或含非法字符、名字以连字符开头/结尾或含连续连字符、description 超过 1024 字符。未知的 frontmatter 字段会被忽略。声明了 frontmatter 但缺少 `description` 的技能，以及格式有误的 `SKILL.md`，会产生警告且**不会**被加载；而完全没有合法 skill frontmatter 的普通 Markdown 文件（前一节discovery规则里说的"不满足格式要求"）则被直接忽略，连警告都不会有——这是"这份文件本来就不是技能" 和 "这份文件想当技能但写错了" 两种情况的区分。不同位置出现同名技能时会警告并保留最先发现的那一个。
 
 ## Prompt Templates
 
