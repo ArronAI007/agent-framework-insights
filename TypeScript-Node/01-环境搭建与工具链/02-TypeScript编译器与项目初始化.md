@@ -125,14 +125,26 @@ Hello, TypeScript!
 HELLO, NODE.JS!
 ```
 
-`tsc` 命令本身没有任何输出（说明没有类型错误），生成的 `hello.js` 会输出两行结果。查看生成的 `hello.js` 可以看到，`export`/`console.log` 逻辑被完整保留（因为 `target` 是 `ES2022`，已经原生支持 `export`，不需要降级成 `require`/`exports`）：
+`tsc` 命令本身没有任何输出（说明没有类型错误），生成的 `hello.js` 会输出两行结果。查看生成的 `hello.js` 可以看到，`export`/`console.log`/`satisfies` 相关的类型标注被完整擦除，只剩下运行时逻辑本身（因为 `target` 是 `ES2022`，已经原生支持 `export`，不需要降级成 `require`/`exports`）：
 
 ```js
+// 带类型标注的导出函数：参数和返回值类型都显式写出
 export function greet(name) {
     return `Hello, ${name}!`;
 }
-console.log(greet("TypeScript"));
+// 故意不标注返回类型，让 TypeScript 通过控制流分析自己推断出结构类型。
+// `satisfies Greeting` 只做一次性的形状校验，不会像显式标注那样改变推断出的类型。
+function buildGreeting(name, loud) {
+    const message = loud ? greet(name).toUpperCase() : greet(name);
+    return { message, loud };
+}
+const normal = buildGreeting("TypeScript", false);
+console.log(normal.message);
+const shouted = buildGreeting("Node.js", true);
+console.log(shouted.message);
 ```
+
+可以看到编译器只是逐行去掉了类型标注（参数类型、返回值类型、`interface Greeting` 声明、`satisfies Greeting`），函数结构和调用顺序和源码完全一一对应——这也是 TypeScript "类型在编译期被擦除，运行期零开销"这条设计原则最直观的体现。
 
 （本课程的 `examples/` 目录只保留 `.ts` 源文件，`hello.js` 是编译产物，验证完可以直接删掉，不需要提交到仓库。）
 
