@@ -36,7 +36,7 @@ export function add(a: number, b: number): number {
 ```
 
 - `outDir: "dist"`：编译产物统一输出到 `dist/` 目录，和 `src/` 源码分开，`dist/` 通常会被 `.gitignore` 排除（不提交编译产物到仓库），但需要被发布进 npm 包。
-- `rootDir: "src"`：显式声明"所有源文件的公共根目录是 `src/`"——不设置这个字段时，TypeScript 7 会直接报错拒绝编译（`error TS5011`），因为它需要一个明确的基准来决定 `dist/` 里的文件层级该怎么摆；漏掉这一步，实测会得到 `dist/src/index.js` 而不是期望的 `dist/index.js`，这个多出来的 `src/` 层级会让下一节 `package.json` 里写的 `main`/`types` 路径全部对不上。
+- `rootDir: "src"`：显式声明"所有源文件的公共根目录是 `src/`"——不设置这个字段时，TypeScript 7 会报错（`error TS5011`），但仍然会继续把编译产物写到一个你可能不想要的目录结构里，因为它需要一个明确的基准来决定 `dist/` 里的文件层级该怎么摆；漏掉这一步，实测会得到 `dist/src/index.js` 而不是期望的 `dist/index.js`，这个多出来的 `src/` 层级会让下一节 `package.json` 里写的 `main`/`types` 路径全部对不上。
 - `declaration: true`：除了编译出 `.js`，额外为每个源文件生成对应的 `.d.ts` 类型声明文件——**这是让 TS 消费者能拿到类型提示的关键**，没有这个选项，`dist/` 里只有 `.js`，消费者装了这个包之后编辑器里完全没有类型信息。
 - `declarationMap: true`：让 `.d.ts` 文件附带 source map（`.d.ts.map`），使得消费者在编辑器里"跳转到定义"时能直接跳到原始的 `.ts` 源码，而不是跳到生成的 `.d.ts` 声明文件——体验上的细节提升，不是必需项，但成本很低、值得默认打开。
 
@@ -138,4 +138,4 @@ v1.1.0
 
 ## 小结
 
-不引入额外打包工具，用项目已有的 `tsc` 加一份继承主配置、打开 `outDir`/`declaration`/`declarationMap` 的 `tsconfig.build.json`，就能把 TS 库编译成带完整类型声明的 `dist/` 产物；`rootDir` 必须显式声明，否则 TypeScript 7 会直接拒绝编译。`package.json` 里 `main` 兜底 CommonJS 消费者，`types`/`exports.types` 让 TS 消费者拿到类型，`exports` 是现代工具链认的入口声明（`types` 条件必须写在前面），`files` 白名单控制发布范围（`package.json`/`README`/`LICENSE` 会被 npm 无条件包含,不需要额外声明）。`npm pack --dry-run` 是发布前必做的预览步骤，`npm version <patch|minor|major>` 按 SemVer 规则自动升级版本号并打 git tag。`files` 白名单相比 `.npmignore` 黑名单更安全，出错时的方向是"漏发"而不是"错发"。到这里，第 06 章「工程化实践」全部结束——从项目结构、测试体系、调试与性能剖析，到今天的构建与发布，覆盖的是把前面几章学到的语言和运行时知识，真正用在一个要交付给别人使用的项目上需要的工程环节。下一章是这门课程最后一章，会先深入内存模型与垃圾回收的原理层面，再落到性能优化实战和常见陷阱清单，最后是课程总结。
+不引入额外打包工具，用项目已有的 `tsc` 加一份继承主配置、打开 `outDir`/`declaration`/`declarationMap` 的 `tsconfig.build.json`，就能把 TS 库编译成带完整类型声明的 `dist/` 产物；`rootDir` 必须显式声明，否则 TypeScript 7 会报错（`error TS5011`）并把产物写到多一层 `dist/src/` 的目录结构里。`package.json` 里 `main` 兜底 CommonJS 消费者，`types`/`exports.types` 让 TS 消费者拿到类型，`exports` 是现代工具链认的入口声明（`types` 条件必须写在前面），`files` 白名单控制发布范围（`package.json`/`README`/`LICENSE` 会被 npm 无条件包含,不需要额外声明）。`npm pack --dry-run` 是发布前必做的预览步骤，`npm version <patch|minor|major>` 按 SemVer 规则自动升级版本号并打 git tag。`files` 白名单相比 `.npmignore` 黑名单更安全，出错时的方向是"漏发"而不是"错发"。到这里，第 06 章「工程化实践」全部结束——从项目结构、测试体系、调试与性能剖析，到今天的构建与发布，覆盖的是把前面几章学到的语言和运行时知识，真正用在一个要交付给别人使用的项目上需要的工程环节。下一章是这门课程最后一章，会先深入内存模型与垃圾回收的原理层面，再落到性能优化实战和常见陷阱清单，最后是课程总结。
