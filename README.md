@@ -1,6 +1,6 @@
 # Agent Framework Insights
 
-> 六套面向"彻底剖析"的中文技术课程,分别系统性拆解六个真实开源 Agent Harness 项目的架构：先会用，再懂原理，最后能扩展。每篇文章都摘录真实源码并逐段讲解设计动机，而不是停留在使用文档层面。
+> 七套中文技术课程：前六套面向"彻底剖析"，系统性拆解六个真实开源 Agent Harness 项目的架构（先会用，再懂原理，最后能扩展；每篇文章都摘录真实源码并逐段讲解设计动机），第七套是独立的 TypeScript / Node.js 体系化教程——不依附任何具体开源项目，面向"会其他语言、没系统学过 TS/Node"的开发者,补齐读懂前六套课程里那些 TypeScript 源码片段所需的语言与运行时基础。
 
 ## 课程一：PI（[earendil-works/pi](https://github.com/earendil-works/pi)）
 
@@ -144,7 +144,29 @@ Andrew Ng 团队开源的桌面 AI coworker：定位是"交付真实成品而非
 
 </details>
 
+## 课程七：TypeScript & Node.js —— 从入门到精通
+
+不依附任何具体开源项目的独立体系化教程，面向"已经会其他编程语言、但没系统学过 TypeScript/Node.js"的开发者：从环境搭建、JS/TS 语法基石，到 TypeScript 类型系统精讲（含类型体操实战）、异步编程模型、Node.js 运行时核心（模块系统/Stream/网络编程/子进程与 Worker Threads），再到工程化实践与性能/内存进阶主题。每篇都配有可运行、可类型检查的示例代码（`TypeScript-Node/examples/`）。学完这套课程，再去读 PI 课程里的 TypeScript 源码片段会顺畅很多。
+
+👉 从 [TypeScript-Node/00-课程导读/README.md](TypeScript-Node/00-课程导读/README.md) 开始。
+
+<details>
+<summary>展开完整目录（35 篇）</summary>
+
+- **00-课程导读**：[README](TypeScript-Node/00-课程导读/README.md)
+- **01-环境搭建与工具链**：[Node.js 版本管理与安装](TypeScript-Node/01-环境搭建与工具链/01-Node.js版本管理与安装.md) · [TypeScript 编译器与项目初始化](TypeScript-Node/01-环境搭建与工具链/02-TypeScript编译器与项目初始化.md) · [包管理器与 NPM 生态](TypeScript-Node/01-环境搭建与工具链/03-包管理器与NPM生态.md) · [开发工具链与调试环境](TypeScript-Node/01-环境搭建与工具链/04-开发工具链与调试环境.md)
+- **02-JavaScript/TypeScript 语法基石**：[值类型、引用类型与相等性](TypeScript-Node/02-JavaScript-TypeScript语法基石/01-值类型引用类型与相等性.md) · [作用域、闭包与 this 绑定](TypeScript-Node/02-JavaScript-TypeScript语法基石/02-作用域闭包与this绑定.md) · [解构、展开与函数高级用法](TypeScript-Node/02-JavaScript-TypeScript语法基石/03-解构展开与函数高级用法.md) · [模块系统：ESM 与 CommonJS](TypeScript-Node/02-JavaScript-TypeScript语法基石/04-模块系统ESM与CommonJS.md) · [迭代器、生成器与集合类型](TypeScript-Node/02-JavaScript-TypeScript语法基石/05-迭代器生成器与集合类型.md)
+- **03-TypeScript 类型系统精讲**：[基础类型与类型推断](TypeScript-Node/03-TypeScript类型系统精讲/01-基础类型与类型推断.md) · [接口、类型别名与联合交叉类型](TypeScript-Node/03-TypeScript类型系统精讲/02-接口类型别名与联合交叉类型.md) · [泛型编程](TypeScript-Node/03-TypeScript类型系统精讲/03-泛型编程.md) · [高级类型：映射、条件与模板字面量类型](TypeScript-Node/03-TypeScript类型系统精讲/04-高级类型-映射条件与模板字面量.md) · [类型体操实战：keyof / typeof / infer](TypeScript-Node/03-TypeScript类型系统精讲/05-类型体操实战-keyof-typeof-infer.md) · [类与面向对象类型系统](TypeScript-Node/03-TypeScript类型系统精讲/06-类与面向对象类型系统.md) · [类型声明文件与第三方库类型](TypeScript-Node/03-TypeScript类型系统精讲/07-类型声明文件与第三方库类型.md)
+- **04-异步编程模型**：[事件循环与任务队列](TypeScript-Node/04-异步编程模型/01-事件循环与任务队列.md) · [Promise 与 async/await 深入](TypeScript-Node/04-异步编程模型/02-Promise与async-await深入.md) · [错误处理与取消机制](TypeScript-Node/04-异步编程模型/03-错误处理与取消机制.md) · [并发控制模式](TypeScript-Node/04-异步编程模型/04-并发控制模式.md)
+- **05-Node.js 运行时核心**：[模块解析与包系统机制](TypeScript-Node/05-Node.js运行时核心/01-模块解析与包系统机制.md) · [文件系统与 Buffer 二进制数据](TypeScript-Node/05-Node.js运行时核心/02-文件系统与Buffer二进制数据.md) · [Stream 流式处理](TypeScript-Node/05-Node.js运行时核心/03-Stream流式处理.md) · [网络编程：HTTP 与 WebSocket](TypeScript-Node/05-Node.js运行时核心/04-网络编程-HTTP与WebSocket.md) · [子进程与 Worker Threads](TypeScript-Node/05-Node.js运行时核心/05-子进程与WorkerThreads.md) · [进程生命周期与优雅关闭](TypeScript-Node/05-Node.js运行时核心/06-进程生命周期与优雅关闭.md)
+- **06-工程化实践**：[项目结构与代码组织](TypeScript-Node/06-工程化实践/01-项目结构与代码组织.md) · [测试体系与 Test Runner](TypeScript-Node/06-工程化实践/02-测试体系与Test-Runner.md) · [调试、性能剖析与内存泄漏排查](TypeScript-Node/06-工程化实践/03-调试性能剖析与内存泄漏排查.md) · [构建打包与 NPM 包发布](TypeScript-Node/06-工程化实践/04-构建打包与NPM包发布.md)
+- **07-进阶主题与总结**：[内存模型与垃圾回收](TypeScript-Node/07-进阶主题与总结/01-内存模型与垃圾回收.md) · [性能优化实战](TypeScript-Node/07-进阶主题与总结/02-性能优化实战.md) · [常见陷阱与最佳实践清单](TypeScript-Node/07-进阶主题与总结/03-常见陷阱与最佳实践清单.md) · [课程总结与进阶方向](TypeScript-Node/07-进阶主题与总结/04-课程总结与进阶方向.md)
+
+</details>
+
 ## 六个项目的架构哲学速览
+
+> 下表只对比前六套"开源项目源码剖析"课程；课程七是独立的语言/运行时教程，不在此对比范围内。
 
 | | PI | DeepSeek Harness | Hermes Agent | OpenHarness | OpenClaw | OpenWorker |
 |---|---|---|---|---|---|---|
