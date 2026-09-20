@@ -53,7 +53,9 @@ export interface SubagentProvider {
 `SubagentCapabilities` 则是一组**启动前**就能检查的静态能力标志(同样在 `types.ts` 里):
 
 ```typescript
+// packages/subagent/subagent/src/types.ts:130-136(当前已新增 agentOptions 字段)
 export interface SubagentCapabilities {
+	readonly agentOptions: boolean
 	readonly outputSchema: boolean
 	readonly depthLimit: boolean
 	readonly toolFilter: boolean
@@ -61,7 +63,9 @@ export interface SubagentCapabilities {
 }
 ```
 
-这四个字段分别对应"能不能约束子代理必须以某个 JSON Schema 结束""能不能强制一个最大递归深度""能不能限制子代理可用的工具集""能不能覆写子代理的人设(persona)"。这组能力检查在真正调用 `provider.start()` 之前就会做——如果调用方要求 `outputSchema` 而当前 Provider 不支持,请求会直接失败,而不是等子代理跑完了才发现结果格式不对。
+这五个字段分别对应"能不能给这个子代理单独覆写 provider/model/推理强度/输出 token 上限这类 Agent 选项""能不能约束子代理必须以某个 JSON Schema 结束""能不能强制一个最大递归深度""能不能限制子代理可用的工具集""能不能覆写子代理的人设(persona)"。`agentOptions` 是相对课程写作时新增的一个能力位——同进程 Provider 会把这份覆写合并到父 Agent 的选项之上再创建子代理,`subagent-dsh-sdk` 则合并到它自己那套独立 harness 实例的默认路由上,而 ACP/Codex/Claude Code 这三个"驾驶别人的车"的 Provider 直接拒绝这个字段(它们没有能力把 provider/model 覆写透传给被驾驶的外部进程)。这组能力检查在真正调用 `provider.start()` 之前就会做——如果调用方要求某个能力而当前 Provider 不支持,请求会直接失败,而不是等子代理跑完了才发现结果格式不对。
+
+`SubagentProvider` 接口本身也多了一个可选字段 `agentRouteDefaults?: Readonly<{ provider: string; model: string }>`——供 Provider 声明一个"静态的、与父代理无关"的默认路由(比如 `subagent-dsh-sdk` 拉起的独立 harness 实例有自己的默认模型),消费方在真正下发请求前,会把这份默认值和调用方传入的 `agentOptions` 覆写做合并。
 
 子代理跑起来之后,拿到的句柄类型是 `SubagentRun`:
 
@@ -82,19 +86,21 @@ export interface SubagentRun {
 子代理终究是一个普通会话(Session),只是它的 `SessionHeader` 多带了几个字段来记录血缘:
 
 ```typescript
-// packages/core/session/src/types.ts:61-69
+// packages/core/session/src/types.ts:93-127(节选,字段随版本演进,以下为当前实际字段)
 export interface SessionHeader {
-	readonly version: number
+	readonly version: typeof SESSION_FORMAT_VERSION
 	readonly id: SessionId
 	readonly createdAt: number
 	readonly cwd?: string
 	readonly parentSession?: SessionId
-	readonly seedLength?: number
+	readonly isSeeded: boolean
 	readonly origin?: 'subagent'
 	readonly delegationDepth?: number
 	readonly agentPreset?: string
 }
 ```
+
+> **一个已验证的实现细节变化**:早期版本里这个字段叫 `seedLength?: number`,直接把"种子历史有多长"这个数字持久化进会话头;当前版本已经把它简化成一个布尔字段 `isSeeded`——头里只记录"这个会话是否带了 fork 继承来的历史前缀",具体前缀有多长被下放成了"Session 状态"而不是头部元数据的一部分。这是一处很典型的"头部只留粗粒度、可复用的判定字段,细节挪到别处"的收窄。
 
 - `parentSession`——这个会话是从哪个会话派生出来的(种子血缘),顶层会话没有这个字段。
 - `origin === 'subagent'`——一个粗粒度的产品分类标记,说明"这个会话是作为子代理创建的"。源码注释特别强调:*这只是展示层的元数据,不是"这个子代理可续接"的证明*——判断能不能续接,要看创建它的 Provider 有没有实现 `prepareContinuable()`,而不是看这个字段。
@@ -138,14 +144,14 @@ export function resolveChildDepth(parent: Agent, maxDepth: number | undefined): 
 子代理创建时,`origin`/`delegationDepth`/`parentSession` 会一起写进子会话头,`packages/subagent/subagent/src/child-agent.ts` 里的 `childSessionMeta()`:
 
 ```typescript
-// packages/subagent/subagent/src/child-agent.ts:102-120（节选)
+// packages/subagent/subagent/src/child-agent.ts:143-155（节选,当前实际实现,已同步 isSeeded 改动)
 return {
 	...(parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {}),
 	...(agentPreset === undefined ? {} : { agentPreset }),
 	parentSession: parentHeader.id,
+	isSeeded,
 	origin: 'subagent',
 	delegationDepth: childDepth,
-	...(lineageSeedLength > 0 ? { seedLength: lineageSeedLength } : {}),
 }
 ```
 
@@ -272,10 +278,11 @@ const turn = await harness.session(childSessionId).run(request.prompt, { onNotif
 模型真正调用的委派工具是 `packages/subagent/tool-subagent/src/index.ts`。有一个反直觉但很关键的设计:**模型在调用这个工具时,既不能选 Provider,也不能选"要不要 fork 历史"**——这些都是部署方在工具配置(`Config`)里锁定好的:
 
 ```typescript
-// packages/subagent/tool-subagent/src/index.ts:29-79(节选)
+// packages/subagent/tool-subagent/src/index.ts:48-90+(节选,当前实际字段,已新增 modelSelectionSettings)
 interface Config {
 	provider: string
 	toolName?: string           // 默认 'subagent'
+	modelSelectionSettings?: boolean  // 相对课程写作时新增
 	enableRunInBackground?: boolean  // 默认 true
 	backgroundMode?: 'one-shot' | 'continuable'  // 默认 'one-shot'
 	agentOptions?: unknown
@@ -284,6 +291,8 @@ interface Config {
 	maxDepth?: number | 'provider-managed'   // 默认 3
 }
 ```
+
+`modelSelectionSettings` 是相对课程写作时新增的一个配置项:开启后,每个新建的**顶层**会话会读取一次 Host 侧的 `subagent-model-selection` 设置(用户在设置面板里选的"子代理该用哪个模型"这类偏好),并把这个决定原样传给它派生出来的所有子代理会话——也就是说这个设置只在顶层会话创建时采样一次,子代理不会各自重新读取、也不会因为用户中途改了设置而"变卦"。
 
 模型侧看到的参数只有 `description`(3~5 词的一句话描述,用于展示)、`prompt`(完整、自包含的任务描述——因为子代理很可能什么上下文都没有,任务描述必须把话说全),以及在 `enableRunInBackground` 开启时的可选 `run_in_background` 布尔值。一个部署可以同时挂载这个工具的多个实例,分别绑定不同 Provider(比如 `subagent`/`subagent_codex`/`subagent_claude_code`),模型看到的是几个名字不同、职责各异的委派工具,而不是一个带"选择 Provider"参数的万能工具——这样可以避免模型因为参数组合过多而"选错搭配"。
 

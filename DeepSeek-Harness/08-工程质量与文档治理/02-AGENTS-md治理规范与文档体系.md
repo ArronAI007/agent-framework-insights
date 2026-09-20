@@ -1,6 +1,6 @@
 # AGENTS.md 治理规范与文档体系
 
-> 根目录的 `AGENTS.md` 只有 149 行、约 1600 词的预算上限,却要管住一个有 56 个工作区、几十个能力 seam 的 monorepo。它做到这一点的方式不是罗列细则,而是把每一次真实踩过的坑压缩成一条一到三行的"站规"(standing order),并把展开的道理链接到别处。本篇选出其中四条最有代表性的规则,逐条讲清楚它们各自解决的真实工程问题,再往上看一层,理解 `docs/` 目录本身的分层治理设计。
+> 根目录的 `AGENTS.md` 有一份严格的字数预算上限(当前是 1950 词,数字定义在 `scripts/doc-budgets.manifest.json` 里,课程写作时是约 1600 词),却要管住一个有 56 个工作区、几十个能力 seam 的 monorepo。它做到这一点的方式不是罗列细则,而是把每一次真实踩过的坑压缩成一条一到三行的"站规"(standing order),并把展开的道理链接到别处。本篇选出其中四条最有代表性的规则,逐条讲清楚它们各自解决的真实工程问题,再往上看一层,理解 `docs/` 目录本身的分层治理设计。
 
 ## 学习目标
 
@@ -124,13 +124,16 @@
 > |---|---|---|
 > | Root `AGENTS.md` | Standing orders: rules an agent needs in context in every session, one to three lines each, linking its home | Stories, worked examples, situational procedures, anything restated from a linked home |
 > | [architecture.md](architecture.md) | Ordered map: composition, core packages, loop, seams, extension points; read before changing `packages/` | Type definitions (→ subsystems), per-package detail (→ package READMEs), decision rationale (→ Agent Notes), implementation-status annotations |
+> | [subsystems/](subsystems/README.md) | One reference page per subsystem: type definitions, semantics, and the generated Cordis API | Behavior narration (→ architecture.md) |
 > | [Agent Notes](../.agents/notes/README.md) | Active decision records: the why, what-was-given-up, and required verification | Migration plans, acceptance-task checklists, fixture walkthroughs, and spec-speak ("should…") once the decision has shipped |
 > | [postmortem/](postmortem/README.md) | Incident stories — the only tier where war-story narrative belongs | — |
 > | Package README | The per-package contract: config, semantics, limitations, extension points | JSDoc restatement, generated-catalog restatement (event/tool tables), other packages' concerns |
 >
 > —— `docs/AGENTS.md`
 
-这份分工可以这样理解:根 `AGENTS.md` 只放"每次会话都要带着走的规则",不放故事和案例(那是 postmortem 的职责);`architecture.md` 只放"改动 `packages/` 之前该知道的地图",不放类型定义的具体细节(那是 subsystems 的职责)、也不放某个决定为什么这么做的取舍过程(那是 Agent Notes 的职责);Agent Notes 只记录"活跃的决策依据",一旦决策落地实现,就不该再保留"应该……"这种还没发生的语气;而 postmortem 是**整个文档体系里唯一被允许讲"事故叙事"的层级**——别的层级如果想复述一个 bug 的来龙去脉,规则会把它当作放错了地方。
+这份分工可以这样理解:根 `AGENTS.md` 只放"每次会话都要带着走的规则",不放故事和案例(那是 postmortem 的职责);`architecture.md` 只放"改动 `packages/` 之前该知道的地图",不放类型定义的具体细节、也不放某个决定为什么这么做的取舍过程(那是 Agent Notes 的职责);Agent Notes 只记录"活跃的决策依据",一旦决策落地实现,就不该再保留"应该……"这种还没发生的语气;而 postmortem 是**整个文档体系里唯一被允许讲"事故叙事"的层级**——别的层级如果想复述一个 bug 的来龙去脉,规则会把它当作放错了地方。
+
+**`subsystems/` 这一档是相对课程写作时长得最明显的一层。** 当前的 `docs/subsystems/` 目录下已经有五十多个页面(`core.md`/`session.md`/`subagent.md`/`workflow.md`/`skills.md`/`sandbox.md` 等等,基本覆盖了本课程后续几篇要讲的每一个子系统),每个子系统一页,职责被限定得很窄——"类型定义、语义,以及一段自动生成的 Cordis API 参考",明确排除"行为叙事"(那属于 `architecture.md`)。这一层不是手写维护的:仓库里有 `verify-type-equiv` 这类脚本负责校验页面里粘贴的类型片段和源码没有漂移,配套的 Agent Note(`2026-08-03-package-anchored-subsystem-pages.md`)记录了"一个类型该挂在哪个子系统页面上"这条归属判定规则,页面里的"cordis-surface"区域则是自动从源码生成、不允许手改的。也就是说,`subsystems/` 从课程写作时一个还比较单薄的目录,长成了一整套有生成工具链、有归属规则、有校验守卫支撑的正式文档层级——这也是为什么第 07 篇能引用 `docs/subsystems/subagent.md`/`workflow.md`/`skills.md` 这类页面来核对具体的类型定义。
 
 这套分工存在的直接理由,写在紧接着的"文档写作规则"一节里:
 
@@ -146,7 +149,7 @@
 
 这两条合起来说明了"一个事实只有一个家"要防止的具体腐化过程:如果同一条规则、同一段机制说明可以随手写在两三个不同的文档里,这些副本会在后续迭代中各自被修改、各自遗漏更新,时间一长就会彼此矛盾——读者读到的到底是哪一份是权威的?这个问题在只有几个文档时不明显,但 DeepSeek Harness 的 `docs/` 目录有六十多项内容,还叠加了中英双语(`.md`/`.zh.md`/`.i18n.yaml` 三件套)的翻译负担,如果没有强制的"唯一归属"原则和一份可以直接 grep 关键短语去核查的检查清单,文档体系本身会比代码库更快陷入不可维护的重复与漂移。
 
-这套治理设计还配了一层机械执行:每一份"标准文档"都有一个字数预算上限(`pnpm run verify-doc-budgets` 强制),根 `AGENTS.md` ≤ 1,600 词、`architecture.md` ≤ 1,800 词、大多数子树 `AGENTS.md` ≤ 600 词。字数预算和"一个事实只有一个家"其实是同一枚硬币的两面:如果一份文档的篇幅被硬性限制住,作者就没有空间去重复展开别处已经讲过的内容,唯一的出路就是把细节挪到它真正归属的那一层,自己这一层只留一条链接。当预算不够用时,`docs/AGENTS.md` 给出的优先顺序也很明确——先"迁移"内容到正确的层级,其次才是"压缩"表达,只有当内容确实需要更多篇幅时才"提高"预算上限,而且提高动作必须在 PR 里对预算清单的改动做出说明,不能悄悄改数字。
+这套治理设计还配了一层机械执行:每一份"标准文档"都有一个字数预算上限(`pnpm run verify-doc-budgets` 强制,具体数字集中定义在 `scripts/doc-budgets.manifest.json` 这份清单里,而不是散落在各个文档正文里),当前根 `AGENTS.md` 的预算是 1950 词、`architecture.md` 是 2410 词(两个数字相对课程写作时都涨了不少,侧面说明这个项目本身还在持续变大)、大多数子树 `AGENTS.md` ≤ 600 词。字数预算和"一个事实只有一个家"其实是同一枚硬币的两面:如果一份文档的篇幅被硬性限制住,作者就没有空间去重复展开别处已经讲过的内容,唯一的出路就是把细节挪到它真正归属的那一层,自己这一层只留一条链接。当预算不够用时,`docs/AGENTS.md` 给出的优先顺序也很明确——先"迁移"内容到正确的层级,其次才是"压缩"表达,只有当内容确实需要更多篇幅时才"提高"预算上限,而且提高动作必须在 PR 里对预算清单的改动做出说明,不能悄悄改数字。
 
 ## 常见问题/易踩坑
 

@@ -81,55 +81,17 @@ overrides:
 
 `vendor/README.md` 里还提到一个容易被忽略的细节:Schemastery 的 `package.json` 额外声明了条件 `exports`(import → `.mjs`,require → `.cjs`),原因是 pnpm 链接的是目录本身,如果没有这份 `exports` 声明,Node 的 ESM 解析器会退回读 `main` 字段从而加载 CJS 入口,而 CJS 入口里的惰性 `require('@deepseek-ai/cosmokit')` 在 vitest 这类会做模块钩子的宿主环境下,可能和 ESM 加载同一个被链接模块产生竞态。这说明"link 到本地目录"本身也带来了新的、需要专门处理的边界情况,不是简单地把 npm 依赖换成本地路径就万事大吉。
 
-### `verify-vendored-links.ts`:反向验证 lockfile 没有背叛策略
+### `verify-vendored-links.ts`(课程写作时存在,当前版本已找不到):反向验证 lockfile 没有背叛策略
 
-光靠配置声明"应该"如何解析还不够——真正的治理动作是有一个自动化脚本,在每次构建前反过来检查 lockfile 的实际解析结果是否遵守了这条策略。`scripts/verify-vendored-links.ts` 做的正是这件事:
+光靠配置声明"应该"如何解析还不够——真正的治理动作是有一个自动化脚本,在每次构建前反过来检查 lockfile 的实际解析结果是否遵守了这条策略。课程写作时,`scripts/verify-vendored-links.ts` 做的正是这件事:遍历 `pnpm-lock.yaml` 的 `importers` 部分确认每一个引用了 vendored 包名的依赖条目都解析到 `link:` 而不是 registry 版本号,再检查 lockfile 顶层的 `packages`/`snapshots` 键确保 vendored 包名从未以 `<name>@<version>` 的形式独立出现——这条注释当时点出的风险是"a registry copy of the same name coexisting with the vendored one silently forks the framework layer"(一份 registry 副本和 vendored 版本同时存在,悄悄分叉出两份框架代码,不会有任何报错提示)。
 
-```typescript
-// scripts/verify-vendored-links.ts
-/**
- * Verify that pnpm-lock.yaml resolves every vendored package name to its
- * workspace `link:` — never a registry copy. `linkWorkspacePackages: true`
- * (pnpm-workspace.yaml) makes matching upstream semver ranges resolve to the
- * pinned vendored sources; a registry copy of the same name coexisting with
- * the vendored one silently forks the framework layer (vendor/README.md).
- */
-
-// Importer resolutions: every dependency entry naming a vendored package must
-// resolve to a link:, or the build silently uses a registry copy.
-for (const [importer, sections] of Object.entries(lockfile.importers ?? {})) {
-  for (const [section, dependencies] of Object.entries(sections)) {
-    for (const [dependency, entry] of Object.entries(dependencies as Record<string, { version?: string }>)) {
-      if (!names.has(dependency)) continue
-      const version = entry.version ?? ''
-      if (!version.startsWith('link:')) {
-        violations.push(`${importer} ${section}.${dependency} resolves to ${JSON.stringify(version)} (expected link:)`)
-      }
-    }
-  }
-}
-
-// Package/snapshot keys: a registry copy materializes as a `<name>@<version>`
-// key; vendored names must never appear there at all.
-for (const section of ['packages', 'snapshots'] as const) {
-  for (const key of Object.keys(lockfile[section] ?? {})) {
-    const atIndex = key.lastIndexOf('@')
-    if (atIndex <= 0) continue
-    const packageName = key.slice(0, atIndex)
-    if (names.has(packageName)) violations.push(`${section} entry ${key} is a registry copy of a vendored package`)
-  }
-}
-```
-
-这个脚本做了两层独立验证:第一层遍历 `pnpm-lock.yaml` 的 `importers` 部分,确认每一个引用了 vendored 包名的依赖条目,其解析出来的 `version` 字段都以 `link:` 开头——如果不是,说明某个包声明依赖的方式绕开了 `overrides`,实际装的是 registry 上的一份副本。第二层更严格,直接检查 lockfile 顶层的 `packages`/`snapshots` 键——一个 registry 副本会在这里以 `<name>@<version>` 的形式materialize 成一条独立记录,只要 vendored 的包名在这里出现过一次,不管它是否被真正使用,都判定为违规。这条注释点出了不做这层检查会有什么后果:"a registry copy of the same name coexisting with the vendored one silently forks the framework layer"——两份代码同时存在,某些间接依赖悄悄解析到了 registry 副本,团队却还以为全仓库都在用同一份被审计过的框架代码,这种"分叉"是静默发生的,不会有任何报错提示,只有这类脚本能把它揪出来。
-
-这个脚本挂在 `package.json` 的 `hygiene` 聚合脚本里:
+**这次更新核实时发现:`scripts/verify-vendored-links.ts` 这个文件在当前版本的仓库里已经找不到了**,`package.json` 的 `hygiene` 脚本也从课程写作时那一长串 `pnpm run X && pnpm run Y && ...` 的链式调用,变成了统一委托给上一篇讲过的门禁编排器:
 
 ```json
-"hygiene": "pnpm run rescope-vendor:check && pnpm run knip && pnpm run publint && pnpm run constraints && pnpm run verify-dsh-package-licenses && pnpm run verify-package-invariants && pnpm run verify-built-package-invariants && pnpm run verify-cordis-config && pnpm run verify-node-next-types && pnpm run verify-runtime-closure && pnpm run verify-vendored-links",
+"hygiene": "tsx scripts/run-gates.ts hygiene",
 ```
 
-和 `rescope-vendor:check`(验证改名一致性)、`verify-cordis-config`、`verify-runtime-closure` 等一系列"仓库不变量"检查并列,成为供应链治理这一大类门禁的一部分,而不是孤立存在的脚本。
+`scripts/run-gates.ts` 里 `hygiene` 模式展开的具体检查项列表里(`rescope-vendor:check`、`publint`、`constraints`、`verify-package-dependencies`、`verify-dsh-package-licenses`、`verify-package-invariants`、`verify-node-next-types`、`verify-cordis-config`、`verify-runtime-closure` 等),没有再找到 `verify-vendored-links` 或明显的同名替代脚本。最接近的、依然存在且承担相关职责的是 `scripts/check-vendor-manifest.sh`(lefthook pre-commit 里的"vendor manifest guard",职责是"改了 `vendor/*/src` 却没同步更新 `vendor/README.md` 就拒绝提交",这和"lockfile 有没有偷偷解析出 registry 副本"是两件不同的事)以及 `rescope-vendor:check`(验证改名一致性)。**这是一个老实报告的发现,而不是猜测出来的替代关系**——如果这个具体的 lockfile 反向校验能力被移除了,那意味着"vendored 包被悄悄从 registry 装了一份副本"这类问题现在依赖 `linkWorkspacePackages: true`+`overrides` 本身的正确性,以及人工审查 `pnpm-lock.yaml` 的 diff,不再有一道自动化门禁专门盯着这件事;读者如果关心这一点,建议直接在自己本地的仓库副本里搜索确认现状,而不要直接采信这里的结论。
 
 ### 供应链治理的分工:AGENTS.md 里的更新流程
 
@@ -146,18 +108,26 @@ Vendoring 只覆盖了 Cordis 生态这一类"完全拥有"的框架层依赖。
 第一道是 **`patchedDependencies`**——对不打算整份 vendor、但确实需要改一行行为的第三方库,用 pnpm 原生的补丁机制:
 
 ```yaml
-# pnpm-workspace.yaml
+# pnpm-workspace.yaml（当前版本;node-pty 的补丁版本号从 1.1.0 涨到了 1.2.0-beta.15,
+# 同时多了两条专门为 Electron 桌面应用打包链路服务的新补丁）
 patchedDependencies:
-  node-pty@1.1.0: patches/node-pty@1.1.0.patch
+  '@electron/osx-sign@1.3.3': patches/@electron__osx-sign@1.3.3.patch
+  '@yao-pkg/pkg@6.21.0': patches/@yao-pkg__pkg@6.21.0.patch
+  node-pty@1.2.0-beta.15: patches/node-pty@1.2.0-beta.15.patch
 ```
 
-`patches/node-pty@1.1.0.patch` 里的真实内容是给 PTY 后端的 spawn-helper 路径解析加了一个可覆盖的环境变量出口:
+`@electron/osx-sign` 和 `@yao-pkg/pkg` 这两条新补丁,几乎可以肯定是伴随第 01 篇提到的 `apps/desktop` Electron 桌面应用一起出现的——前者是 macOS 应用签名工具,后者是把 Node 应用打包成单文件可执行体的工具,都属于"桌面/可执行体分发链路"这一类新增的构建需求。
+
+`patches/node-pty@1.2.0-beta.15.patch` 里的真实内容,还是给 PTY 后端的 spawn-helper 路径解析加一个可覆盖的环境变量出口,核心逻辑和课程写作时基本一致,只是版本号跟着 node-pty 本身的升级往前挪了一格,注释里还新增了一句直接点名意图的说明("A current external embedded-runtime consumer supplies a non-sibling helper"——这句新注释同样在暗示 Electron 桌面这个新增消费者):
 
 ```diff
 --- a/lib/unixTerminal.js
 +++ b/lib/unixTerminal.js
 -var helperPath = native.dir + '/spawn-helper';
 -helperPath = path.resolve(__dirname, helperPath);
+-helperPath = helperPath.replace('app.asar', 'app.asar.unpacked');
+-helperPath = helperPath.replace('node_modules.asar', 'node_modules.asar.unpacked');
++// A current external embedded-runtime consumer supplies a non-sibling helper.
 +var helperPath = process.env.DSH_NODE_PTY_SPAWN_HELPER;
 +if (helperPath) {
 +    helperPath = path.resolve(helperPath);
@@ -169,7 +139,9 @@ patchedDependencies:
 +    }
 +    else {
 +        helperPath = native.dir + '/spawn-helper';
-+        ...
++        helperPath = path.resolve(__dirname, helperPath);
++        helperPath = helperPath.replace('app.asar', 'app.asar.unpacked');
++        helperPath = helperPath.replace('node_modules.asar', 'node_modules.asar.unpacked');
 +    }
 +}
 ```
@@ -179,22 +151,22 @@ patchedDependencies:
 第二道是 **`allowBuilds`**——pnpm 10+ 默认阻止任何声明了 install/build 脚本的依赖执行该脚本,除非显式列入允许清单,这是防止供应链投毒(恶意包在 `postinstall` 里执行任意代码)的默认拒绝策略:
 
 ```yaml
-# pnpm-workspace.yaml
-# pnpm 10+ blocks any dependency shipping an install/build script until it is
-# explicitly reviewed here (strictDepBuilds defaults to true: an unlisted script
-# is a hard install error). Every such package MUST be listed; we deny by
-# default and only allow scripts we need.
+# pnpm-workspace.yaml（当前版本,列表比课程写作时长了不少,新增条目大多和
+# Electron 桌面打包、更细分的可选依赖有关）
 allowBuilds:
   esbuild: true
   lefthook: true
   node-pty: true
-  koffi: true
   '@google/genai': false
   protobufjs: false
   node-addon-require-builtin: false
+  koffi: true
+  '@deepseek-ai/dsh-subprocess-local@file:packages/subprocess/subprocess-local': true
+  electron-winstaller: false
+  msgpackr-extract: false
 ```
 
-每一行都带着取舍理由的注释:`esbuild`(原生二进制)、`lefthook`(git hook 安装)、`node-pty`(跨平台 PTY 后端,包括 Windows ConPTY)、`koffi`(JSONL 持久化在 Windows 上调用 `MoveFileExW`)确实需要自己的构建脚本而被允许;`@google/genai`、`protobufjs`、`node-addon-require-builtin` 则被显式**拒绝**执行脚本——即使它们声明了脚本,仓库判断这些脚本对当前用法是无操作的空跑,拒绝执行不影响安装成功。这一套白名单和 vendoring manifest 是同构的治理模式:**默认不信任,每一条例外都要有名字、有理由、留痕在版本控制里**。
+每一行都带着取舍理由的注释:`esbuild`(原生二进制)、`lefthook`(git hook 安装)、`node-pty`(跨平台 PTY 后端,包括 Windows ConPTY)、`koffi`(JSONL 持久化在 Windows 上调用 `MoveFileExW`)确实需要自己的构建脚本而被允许;`@google/genai`、`protobufjs`、`node-addon-require-builtin`、`electron-winstaller`、`msgpackr-extract` 则被显式**拒绝**执行脚本——即使它们声明了脚本,仓库判断这些脚本对当前用法是无操作的空跑(比如 `electron-winstaller` 的脚本只是挑选它内置的 Squirrel.Windows 安装器用的 7-Zip 可执行文件,而桌面应用在 Windows 上走的是 NSIS 打包,这个脚本的产物根本用不上),拒绝执行不影响安装成功。新增的 `'@deepseek-ai/dsh-subprocess-local@file:...': true` 这一条比较特殊——它精确到了具体版本/来源(一个 `file:` 本地路径依赖),注释说明这是 Python 运行时部署时需要的一个"恢复 node-pty macOS spawn helper 可执行位"的 postinstall 脚本,已经过评审。这一套白名单和 vendoring manifest 是同构的治理模式:**默认不信任,每一条例外都要有名字、有理由、留痕在版本控制里**,而且随着仓库新增桌面应用这类新的分发形态,例外清单本身也在同步增长。
 
 再往外一层,`THIRD_PARTY_NOTICES.md` 把这套治理结果对外部消费者可见化——文件顶部声明它是自动生成、不可手改:
 

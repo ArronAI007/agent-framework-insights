@@ -71,98 +71,99 @@ npm 包名是 `@deepseek-ai/dsh`,但它声明的 `bin.dsh` 指向构建产物 `l
 
 ### 命令分发：`bin.ts` 里的三种模式
 
-`apps/cli/src/bin.ts` 是整个 CLI 的入口，逻辑很短：先解析参数,再按模式分发到不同的实现文件：
+`apps/cli/src/bin.ts` 是整个 CLI 的入口，逻辑很短：先解析参数,再按模式分发到不同的实现文件（下面这段是当前仓库的真实实现，比早期版本多了一层错误兜底和一个显式的执行入口守卫）：
 
 ```typescript
 // apps/cli/src/bin.ts
-import { loadLayeredEnv } from '@deepseek-ai/dsh-app-boot'
+import { loadLayeredEnv, StartupError } from '@deepseek-ai/dsh-app-boot'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { parseDshArgs } from './args.ts'
+import { reportStartupFailure } from './startup-diagnostics.ts'
 
-const invocation = parseDshArgs(process.argv.slice(2), readVersion())
+export async function runCli(): Promise<void> {
+  const version = readVersion()
+  const invocation = parseDshArgs(process.argv.slice(2), version)
 
-switch (invocation.mode) {
-  case 'profile': {
-    const { runProfile } = await import('./profile-boot.ts')
-    await runProfile({
-      environment: loadLayeredEnv('dsh'),
-      profile: invocation.profile,
-      patchFiles: invocation.patches,
-      args: invocation.args,
-    })
-    break
+  switch (invocation.mode) {
+    case 'profile': {
+      const { runProfile } = await import('./profile-boot.ts')
+      try {
+        await runProfile({
+          environment: loadLayeredEnv('dsh'),
+          profile: invocation.profile,
+          fromDefaultProfile: invocation.fromDefaultProfile,
+          patchFiles: invocation.patches,
+          args: invocation.args,
+        })
+      } catch (error) {
+        if (!(error instanceof StartupError)) throw error
+        await reportStartupFailure(error, { home: resolveDshHome(), version, profile: invocation.profile })
+        process.exit(1)
+      }
+      break
+    }
+    case 'plugin': {
+      const { runPlugin } = await import('./plugin.ts')
+      process.exit(await runPlugin(invocation.profile, invocation.args))
+      break
+    }
+    case 'dump-config': {
+      const { runDumpConfig } = await import('./dump-config.ts')
+      runDumpConfig(
+        invocation.profile,
+        invocation.defaultOnly,
+        invocation.patches,
+        invocation.fromDefaultProfile,
+      )
+      break
+    }
+    default:
+      invocation satisfies never
+      throw new Error(`dsh: unhandled invocation mode ${JSON.stringify(invocation)}`)
   }
-  case 'plugin': {
-    const { runPlugin } = await import('./plugin.ts')
-    process.exit(runPlugin(invocation.profile, invocation.args))
-    break
-  }
-  case 'dump-config': {
-    const { runDumpConfig } = await import('./dump-config.ts')
-    runDumpConfig(invocation.profile, invocation.defaultOnly, invocation.patches)
-    break
-  }
-  default:
-    invocation satisfies never
-    throw new Error(`dsh: unhandled invocation mode ${JSON.stringify(invocation)}`)
+}
+
+if (import.meta.main) {
+  await runCli()
 }
 ```
 
-值得留意的是每个分支都用了**动态 `import()`**而不是顶层静态导入。模块顶部的注释解释了原因：
+三个值得留意的变化：
 
-```typescript
-// apps/cli/src/bin.ts
-/**
- * dsh — command-line entry. Dynamic imports per mode keep unrelated modes out
- * of each dispatch path; the adapter prints and exits for
- * `--help`/`--version`/a parse error, so only a valid mode reaches the switch.
- */
-```
-
-也就是说，如果你只是运行 `dsh plugin --profile tui add some-package`，进程根本不需要加载 `profile-boot.ts` 里那一整套"装配插件树、启动 HTTP 服务"的代码——三种模式互不污染彼此的加载路径，启动速度和内存占用都更可控。`invocation satisfies never` 这一行是 TypeScript 的"穷尽性检查"写法：如果未来 `DshInvocation` 联合类型新增了一个模式而这里忘了处理，编译期就会报错，而不是留到运行时才发现分发逻辑漏了一支。
+1. **每个分支依旧用动态 `import()`**而不是顶层静态导入——这一点没变。如果你只是运行 `dsh plugin --profile tui add some-package`，进程根本不需要加载 `profile-boot.ts` 里那一整套"装配插件树、启动 HTTP 服务"的代码——三种模式互不污染彼此的加载路径，启动速度和内存占用都更可控。`invocation satisfies never` 这一行是 TypeScript 的"穷尽性检查"写法：如果未来 `DshInvocation` 联合类型新增了一个模式而这里忘了处理，编译期就会报错，而不是留到运行时才发现分发逻辑漏了一支。
+2. **分发逻辑被包进了一个导出的 `runCli()` 函数，配合 `if (import.meta.main)` 守卫**——这不只是代码风格调整：把整个 CLI 主流程做成一个可以被 `import` 的函数，意味着测试代码或者未来别的入口（比如桌面壳，见下文）可以直接调用 `runCli()`，而不必真的 fork 一个子进程去跑 `bin.ts`；`import.meta.main` 是 Node 用来判断"当前模块是不是被直接执行的入口文件"的标准写法，只有满足这个条件才会自动跑一次 `runCli()`，被别处 `import` 时则不会有副作用。
+3. **`profile` 分支新增了 `try/catch`，专门捕获 `StartupError` 并交给 `reportStartupFailure` 统一渲染**——之前的版本里，装配阶段的任何失败都会是一段裸的 Node 异常堆栈；现在 `profile-boot.ts` 会把"可预期的启动失败"（比如补丁文件语法错误、缺少必需的凭证引用）包装成 `StartupError`，`bin.ts` 捕获后调用 `reportStartupFailure` 生成一份带 `$DSH_HOME`、版本号、Profile 名字上下文的诊断信息，再用 `process.exit(1)` 退出——这是"给用户看得懂的错误提示"和"给开发者看的完整堆栈"之间的一个折中：只有 `StartupError` 会被这样格式化，其他意料之外的异常仍然会原样抛出，不会被这层 catch 悄悄吞掉。
 
 ### `web` 是 `--profile web` 的别名
 
-`apps/cli/src/args.ts` 用 `commander` 解析参数，模块顶部的注释直接点明了 `web` 子命令的本质：
+`apps/cli/src/args.ts` 用 `commander` 解析参数。**这里有一处需要更正的地方**：这一篇早先的版本里，`web` 曾经是 `apps/cli` 里唯一一个硬编码的 commander 子命令，模块顶部注释当时写的是"`web` is a hardcoded alias for `--profile web`"。当前仓库已经把这条能力**通用化**了，模块顶部注释也相应改成了：
 
 ```typescript
 // apps/cli/src/args.ts
 /**
- * `web` is a hardcoded alias for `--profile web`; `plugin` manages a profile's
- * plugin dependencies by forwarding to pnpm.
+ * `dsh <name>` abbreviates `dsh --profile <name>`; `plugin` manages a
+ * profile's plugin dependencies by forwarding to pnpm.
  */
 ```
 
-对应的实现里，`web` 子命令解析完自己的 flag 之后，直接调用和默认命令共享的 `resolveBoot`，把 profile 名字硬编码为 `'web'`：
+也就是说现在不只是 `web`，任何 Profile 名字都可以直接跟在 `dsh` 后面——`dsh web`、`dsh headless "task"`、`dsh tui`，乃至你自己起的 Profile 名字，都是 `dsh --profile <name>` 的等价简写，不再是"`web` 特别硬编码，其他名字都得写全 `--profile`"这套规则。这条改写发生在真正交给 commander 解析**之前**：只要第一个参数不是以 `-` 开头的 flag、也不是字面量 `plugin`，就会在参数最前面插进一个 `--profile`。
 
-```typescript
-// apps/cli/src/args.ts（节选）
-const web = program.command('web').description('boot the web profile (alias of --profile web); the web app\'s own flags follow')
-web
-  .helpOption(false)
-  .allowUnknownOption()
-  .passThroughOptions()
-  .enablePositionalOptions()
-  .argument('[args...]', 'arguments for the web app (see: dsh web --help)')
-  .option('--patch <path>', 'extra patch-list overlay applied after the profile layer (repeatable)', collect)
-  .action((args: string[], options: BootOptions) => {
-    rejectParentOptions('web')
-    resolved = resolveBoot(web, 'web', options, args)
-  })
-```
-
-所以 `dsh web --port 8080` 和 `dsh --profile web --port 8080` 是完全等价的两种写法，区别只是前者更好记。`args.ts` 顶部的帮助文本也直接给出了这种等价关系：
+所以 `dsh web --port 8080` 和 `dsh --profile web --port 8080` 依然是完全等价的两种写法，区别只是前者更好记；只是这个"更好记的简写"现在对所有 Profile 名字都成立，而不只是 `web` 一个特例。`args.ts` 顶部的帮助文本也直接给出了几个等价关系的例子：
 
 ```typescript
 // apps/cli/src/args.ts
 const HELP_EXAMPLES = `
 Examples:
-  dsh --profile web                          boot the web profile (same as: dsh web)
-  dsh --profile headless "run the tests"     answer one task, print the result, and exit
+  dsh web                                   boot the web profile (same as: dsh --profile web)
+  dsh rescue --from-default-profile web
+                                            create rescue from the shipped web template, then boot it
+  dsh headless "run the tests"              answer one task, print the result, and exit
+  dsh tui --patch ./extra.yml               boot a custom profile with one extra overlay
   ...
 `
 ```
 
-关于参数解析还有一个设计细节：`--profile` 之后的参数解析在**第一个不认识的 token** 处停下，剩下的全部原样转交给被启动的 app 自己解析（这就是为什么 `dsh --profile tui -h` 打印的是 `tui` 应用自己的帮助，而不是 launcher 的帮助）。这个边界具体如何拆分命令行、如何做 Profile 装配，第 03 篇会展开讲。
+关于参数解析还有一个设计细节：`--profile` 之后的参数解析在**第一个不认识的 token** 处停下，剩下的全部原样转交给被启动的 app 自己解析（这就是为什么 `dsh --profile tui -h` 打印的是 `tui` 应用自己的帮助，而不是 launcher 的帮助）。这个改写规则、`plugin` 为什么被排除在外、以及新出现的 `--from-default-profile`（从官方模板创建一个新 Profile）具体怎么用，第 03 篇会展开讲。
 
 ### Web UI 默认绑定地址：`127.0.0.1:3080`
 
@@ -241,6 +242,21 @@ CLI（`apps/cli`）在这条链路里的角色，仅仅是**装配出承载这�
 ```
 
 它的 `description` 已经写明了关系：这个包用 Vite 把 `@deepseek-ai/dsh-client-web` 这个"浏览器端插件外壳库"打包成 `dist/`，而这个 `dist/` 最终是被 `apps/cli` 的 `dsh web`（也就是 `web-app` 补丁层里的 `web-runtime` 行）解析并托管出来的静态资源。这印证了课程导读里提到的"Host 与 Client 物理分离"——`apps/web` 是纯浏览器端工程，和跑在 Node 里的 `apps/cli` 是两个独立的构建产物，只通过约定好的 `dist/` 路径和运行时 WebSocket 协议衔接。
+
+### 补充：`apps/desktop`，一个新出现的第三种运行形态
+
+课程写到这里时（2026 年 8 月中），`dsh` 只有"CLI 跑源码/发布包"和"浏览器打开 `dsh web`"这两种形态。仓库从 2026-08-28 起新增了 `apps/desktop`：
+
+```json
+// apps/desktop/package.json（节选）
+{
+  "name": "@deepseek-ai/dsh-desktop",
+  "description": "Electron desktop shell for a bundled dsh runtime and external plugins",
+  ...
+}
+```
+
+配合一个私有的 `apps/desktop-host`（`description` 是 "Private Node-mode host process for the Electron desktop application"），这是一个用 Electron 打包的原生桌面壳：把 `dsh` 运行时和一份自带的 Node 环境一起打包分发，用户不需要自己装 Node/pnpm 就能跑起完整的 Agent。这条路径本质上仍然是"装配出前面讲的同一棵插件树"，只是把"谁来托管 Web UI 的浏览器窗口"从系统浏览器换成了 Electron 自带的 Chromium——对理解"CLI 装配 Profile"这条主线没有影响，值得知道的是它的存在，具体的打包与更新机制不在本课程的讨论范围内（这是一个 2026-08-28 之后才出现的能力，本课程后续章节的源码解读仍以 `apps/cli`/`apps/web` 这条 Node/浏览器路径为主）。
 
 ## 常见问题/易踩坑
 

@@ -45,11 +45,12 @@ interface Context {
 ### 根 `tsconfig.json`:一个"无程序"的引用清单
 
 ```jsonc
-// tsconfig.json
+// tsconfig.json（当前版本；注释里对 examples/ 的提法已经去掉，
+// 因为 examples 这个 workspace 成员在第 01 篇写作后被整体移除了）
 {
   // Solution file: the whole-repo graph for `tsc -b tsconfig.json` and the
   // tsserver entry. `extends` carries the base paths for get-tsconfig
-  // consumers — tsx running examples/ and scripts/ (no nearer tsconfig)
+  // consumers — tsx running scripts/ (no nearer tsconfig)
   // resolves workspace imports through this file. `files: []` keeps it
   // program-less, so the host/client cordis Context merges never meet.
   // NEVER add include/files entries, and NEVER flatten this solution into a
@@ -128,7 +129,7 @@ interface Context {
 }
 ```
 
-`tsconfig.client.json` 继承的正是这份 `tsconfig.base.client.json`,而不是 `tsconfig.host.json` 继承的 `tsconfig.base.json`——差异只有三处,却每一处都在划清"这是浏览器代码"的边界:`lib` 换成 `["ES2024", "DOM", "DOM.Iterable"]`(能用 `document`、`window`,不能用 Node 的 ambient 类型);`jsx: "react-jsx"`(浏览器端才需要 JSX 转换);`types: []`(不隐式引入任何全局类型包,包括 `@types/node`——需要 Node 类型的个别包必须在自己的 tsconfig 里显式声明)。
+`tsconfig.client.json` 继承的正是这份 `tsconfig.base.client.json`,而不是 `tsconfig.host.json` 继承的 `tsconfig.base.json`——差异集中在几处,每一处都在划清"这是浏览器代码"的边界:`lib` 换成 `["ES2024", "DOM", "DOM.Iterable", "ESNext.Disposable"]`(能用 `document`、`window`、显式资源释放语法,不能用 Node 的 ambient 类型);`jsx: "react-jsx"`(浏览器端才需要 JSX 转换);`types` 不再是空数组,而是 `["client-build-environment"]`,配合 `typeRoots: ["./scripts/types", "./node_modules/@types"]` 指向仓库自己维护的一个环境声明包(`scripts/types/client-build-environment`)——它只声明了打包器会在构建期替换掉的少数几个 `process.env.*` 字段(`NODE_ENV` 和形如 `DSH_CLIENT_*` 的自定义变量),依然做到"不引入 `@types/node` 这类完整的 Node 环境类型",只是把"完全不声明 `process`"换成了"精确声明打包期真的会替换的那几个字段",让浏览器代码里出现的少量 `process.env.xxx` 判断也能过类型检查。
 
 `tsconfig.client.json` 本身:
 
@@ -214,10 +215,12 @@ declare module '@deepseek-ai/cordis' {
 类型检查分两半只是故事的一半,产物构建同样分两条流水线。根 `package.json` 里:
 
 ```json
-"build:lib": "npm run build:lib:host && npm run build:lib:client",
-"build:lib:host": "tsc -b tsconfig.host.json && tsdown --env.DSH_BUILD_FACE host",
+"build:lib": "pnpm run build:lib:host && pnpm run build:lib:client",
+"build:lib:host": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc -b tsconfig.host.json && tsdown --env.DSH_BUILD_FACE host",
 "build:lib:client": "tsc -b tsconfig.client.json && tsdown --env.DSH_BUILD_FACE client",
 ```
+
+（脚本管理器从 npm 换成了 pnpm,这和第 01 篇讲的 `pnpm-workspace.yaml` 是一致的;Host 侧的 `tsc -b` 现在还多了一层显式的 `node --max-old-space-size=4096` 包装——这是仓库体量继续增长后,Host 聚合工程的类型检查图变得足够大,需要手动把 V8 堆上限调高才能稳定跑完的直接证据,侧面印证了第 01 篇"叶子包从 219 涨到 291"这件事对工程侧的真实代价。）
 
 每一面先用对应的 `tsc -b` 把 TypeScript 降级成 JavaScript(降级到各自 `lib/types` 目录),再用 tsdown 把 JS 打包成最终发布产物。`tsdown.config.ts` 就是这条分流的入口:
 
@@ -241,7 +244,9 @@ function isBuildFaceClient(value: unknown): boolean {
 export default defineConfig(({ env }) => {
   const client = isBuildFaceClient(env?.DSH_BUILD_FACE)
   return {
-    workspace: ['vendor/*', 'packages/*/*', 'apps/cli'],
+    workspace: client
+      ? ['vendor/*', 'packages/*/*', 'apps/cli']
+      : ['vendor/*', 'packages/*/*', 'apps/cli', 'apps/desktop', 'apps/desktop-host'],
     entry: client ? '' : ['lib/types/{index,invariant,startup}.js'],
     outDir: 'lib',
     format: ['esm'],
@@ -256,6 +261,8 @@ export default defineConfig(({ env }) => {
 ```
 
 这里的分流策略很微妙:Host Pass(`DSH_BUILD_FACE=host`,或不传)对**每一个** workspace 包统一打包 `lib/types/{index,invariant,startup}.js` 三个标准入口,并顺手跑一次 Typert 产物生成器。Client Pass(`DSH_BUILD_FACE=client`)则把 `entry` 清空(`''`)——也就是说对绝大多数包什么都不做,真正需要产出浏览器 bundle 的包必须**自带一份 package 级 `tsdown.config.ts`**,用自己的配置覆盖掉这份根配置,自行决定要不要在 Client Pass 里再emit 一份 Node 半区和一份浏览器半区。
+
+值得注意的是,`workspace` 字段现在按 Host/Client 分成了两份不同的包列表:Client Pass 依然只覆盖 `apps/cli`,但 Host Pass 多出了 `apps/desktop` 和 `apps/desktop-host`——课程第 01 篇写作之后新增的 Electron 桌面应用及其宿主进程,只需要 Node 端的标准入口打包,完全不需要经过 Client Pass 的浏览器 bundle 流程,这也印证了它们本质上是"桌面壳套了一层 Electron,内部驱动逻辑仍是 Node 进程"。
 
 这份"包级覆盖"的公共实现就是 `packages/client/tsdown.client.ts`,它导出的 `clientBundle()` 帮助函数被每个 UI 插件包的 `tsdown.config.ts` 调用:
 
@@ -280,11 +287,25 @@ export function clientBundle(
 }
 ```
 
-默认情况下(`options.hostPhase` 不设置),一个客户端插件包在 Host Pass 里完全跳过(`SKIP_WORKSPACE_BUILD` = `{ entry: '' }`),把 Node 半区和浏览器半区**都**留给 Client Pass 一起产出——这样浏览器 bundle 打包时,Rolldown 能直接看到刚生成的 `lib/types/client/index.js`,不需要额外的跨阶段协调。`clientConfig()` 里还藏着浏览器打包必须处理的一整套细节:
+默认情况下(`options.hostPhase` 不设置),一个客户端插件包在 Host Pass 里完全跳过(`SKIP_WORKSPACE_BUILD` = `{ entry: '' }`),把 Node 半区和浏览器半区**都**留给 Client Pass 一起产出——这样浏览器 bundle 打包时,Rolldown 能直接看到刚生成的 `lib/types/client/index.js`,不需要额外的跨阶段协调。`clientConfig()` 里还藏着浏览器打包必须处理的一整套细节。这部分代码在课程写作之后经历了一次实质性重构——最核心的变化是 externals 机制从"一份写死的全局 `CLIENT_EXTERNALS` 数组"变成了"共享基线 + 每个包自己声明"的组合:
 
 ```typescript
-// packages/client/tsdown.client.ts
-function clientConfig(id: string, entry: string): UserConfig {
+// packages/client/tsdown.client.ts（当前版本节选,做了删减聚焦于 externals/purity 这条主线;
+// 实际实现还包含更完整的 CSS Modules/内联样式虚拟模块、异步 chunk 拆分等逻辑）
+function clientExternals(id: string): ReadonlySet<string> {
+  const cached = clientExternalCache.get(id)
+  if (cached !== undefined) return cached
+  const externals = new Set([
+    ...PLATFORM_MODULES,
+    ...PRELOADED_CLIENT_EXTERNALS,
+    ...requestedExternals(id, workspaceManifest(id).dsh?.client ?? {}),
+  ])
+  clientExternalCache.set(id, externals)
+  return externals
+}
+
+function clientConfig(id: string, entry: string, clientBanner?: (fileName: string) => string | undefined): UserConfig {
+  const isRequested = (specifier: string): boolean => clientExternals(id).has(specifier)
   return {
     name: `${id}/client`,
     entry: { client: entry },
@@ -294,29 +315,32 @@ function clientConfig(id: string, entry: string): UserConfig {
     dts: false,
     sourcemap: true,
     clean: false,
-    external: [...CLIENT_EXTERNALS],
+    deps: {
+      neverBundle: isRequested,
+      alwaysBundle: (specifier: string) => !isRequested(specifier),
+    },
     define: {
+      ...clientBuildEnvironmentDefines(process.env),
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
       'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),
       'import.meta.env': JSON.stringify({ MODE: process.env.NODE_ENV ?? 'production' }),
     },
-    noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
     plugins: [{
       name: 'dsh-client-bundle-purity',
       resolveId(source: string) {
         if (!source.startsWith('@deepseek-ai/')) return null
-        if (CLIENT_EXTERNALS.includes(source)) return null // platform module: external wins
+        if (isRequested(source)) return null // requested module-table row: external wins
         if (VENDORED_LIBRARY.test(source)) return null // vendored library: inline, no shared identity
         if (INLINE_SAFE.test(source) || GENERATED_REMOTE.test(source)) return null
         throw new Error(
-          `client bundle purity: "${source}" is not a platform module (CLIENT_EXTERNALS), an inline-safe wire layer, or a generated /remote contribution — `
-          + 'cross-plugin value imports are forbidden; collaborate through cordis services (type-only imports are erased and never reach this gate)',
+          `client bundle purity: "${source}" is not in the default client externals or ${id}'s dsh.client.external, an inline-safe wire layer, or a generated /remote contribution — `
+          + 'cross-plugin value imports are forbidden; declare a non-default module request or collaborate through cordis services '
+          + '(type-only imports are erased and never reach this gate)',
         )
       },
-    }, /* ...CSS Modules 内联插件... */],
+    } /* ...CSS Modules 内联插件、异步 chunk require 插件等... */],
     outputOptions: {
       entryFileNames: 'client.js',
-      sourcemapPathTransform: browserSourcePath,
       banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(id)}, factory: (require) => {`,
       footer: 'return module.exports; } });',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
@@ -325,7 +349,7 @@ function clientConfig(id: string, entry: string): UserConfig {
 }
 ```
 
-这段配置里 `dsh-client-bundle-purity` 插件是构建期对"双面构建"约束的又一层强制——它在 `resolveId` 阶段拦截每一个 `@deepseek-ai/*` 的导入,只允许三类情况通过:平台模块(`CLIENT_EXTERNALS`,走浏览器端的模块加载表,不打进 bundle)、vendored 库(如 `cosmokit`,没有跨插件运行时身份,可以安全内联)、显式标记为"无运行时身份的线路层"的包。任何其他跨插件的**值导入**都会在构建期直接抛错——类型系统层面"两侧互不可见"的约束,在打包器层面变成了"跨插件协作只能走 Cordis 服务,不能靠 import 抄近路"的强制检查。
+`external`/`noExternal` 这两个 tsdown 的通用选项,现在被 `deps.neverBundle`/`deps.alwaysBundle` 这一对更细粒度的谓词函数取代——语义没有变(还是"外部化 vs 内联"这个二分),但判断依据从"是否在一份写死的数组里"变成了"是否在 `clientExternals(id)` 算出的这个包专属的许可集合里"。这个集合由三部分拼起来:仓库统一的平台模块基线(`PLATFORM_MODULES`)、预置的常用外部依赖(`PRELOADED_CLIENT_EXTERNALS`),以及**这个包自己 `package.json` 里 `dsh.client.external` 字段声明的额外请求项**(`requestedExternals()` 从 `workspaceManifest(id).dsh?.client` 里读出来)——也就是说,原来"哪些模块能被外部化"是一份仓库级别的全局清单,现在下放成了"每个客户端包在自己的 `package.json` 里显式声明自己还需要哪些额外的外部依赖",`dsh-client-bundle-purity` 插件的报错信息里也把这一点讲得很直白("...or ${id}'s dsh.client.external...")。`dsh-client-bundle-purity` 插件本身承担的角色没有变——它依然是构建期对"双面构建"约束的又一层强制:在 `resolveId` 阶段拦截每一个 `@deepseek-ai/*` 的导入,只允许平台/包自己声明的外部模块、vendored 库、显式标记为"无运行时身份的线路层"的包这三类情况通过,任何其他跨插件的**值导入**都会在构建期直接抛错。
 
 ## 常见问题/易踩坑
 

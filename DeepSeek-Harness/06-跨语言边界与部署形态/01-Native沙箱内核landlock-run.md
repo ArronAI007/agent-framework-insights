@@ -1,12 +1,12 @@
 # Native 沙箱内核 landlock-run
 
-> `bwrap`（bubblewrap）是 dsh 在 Linux 上的第一选择沙箱后端，但它依赖 mount namespace 权限——容器套容器、CI runner、某些企业级安全策略下的宿主机,往往直接不允许创建 namespace。这种"降级到不设防"是不可接受的,dsh 的答案是再造一个更轻量、只依赖 Landlock LSM 的独立启动器：`native/landlock-run`。本篇通读它唯一的源码文件 `main.c`（约 298 行手写 C11）和消费它的 TypeScript 胶水代码,搞清楚一个"自我限制后再 exec"的沙箱启动器是怎么把内核 UAPI、fail-closed 设计和 Node 生态的包分发揉在一起的。
+> `bwrap`（bubblewrap）是 dsh 在 Linux 上的第一选择沙箱后端，但它依赖 mount namespace 权限——容器套容器、CI runner、某些企业级安全策略下的宿主机,往往直接不允许创建 namespace。这种"降级到不设防"是不可接受的,dsh 的答案是再造一个更轻量、只依赖 Landlock LSM 的独立启动器：`native/system`。本篇通读它唯一的源码文件 `main.c`（约 298 行手写 C11）和消费它的 TypeScript 胶水代码,搞清楚一个"自我限制后再 exec"的沙箱启动器是怎么把内核 UAPI、fail-closed 设计和 Node 生态的包分发揉在一起的。
 
 ## 学习目标
 
 - 理解为什么 dsh 在 `bwrap` 之外还需要一条 Landlock 路径：mount namespace 权限不可用时的降级方案,而不是 `bwrap` 的替代品。
-- 弄清楚 `native/landlock-run` 的真实实现形态——纯 C11 直连内核 UAPI 的独立可执行文件,不依赖 `<linux/landlock.h>`,也不是 Rust/Zig 或 N-API/FFI 绑定。
-- 理解包名 `@deepseek-ai/node-addon-landlock-run` 里 "node-addon-" 前缀的真实含义：它模仿的是 esbuild 式"一个入口包 + 每平台一个二进制包"的分发模型,而不是真正的 Node addon。
+- 弄清楚 `native/system` 的真实实现形态——纯 C11 直连内核 UAPI 的独立可执行文件,不依赖 `<linux/landlock.h>`,也不是 Rust/Zig 或 N-API/FFI 绑定。
+- 理解包名 `@deepseek-ai/node-addon-system` 里 "node-addon-" 前缀的真实含义：它模仿的是 esbuild 式"一个入口包 + 每平台一个二进制包"的分发模型,而不是真正的 Node addon——即便这个包现在确实**也**打包了一个真正的 N-API addon（见下文"和 flock 的对照"）。
 - 掌握 fail-closed 设计的具体落地：任何启动器级失败退出码 125 且绝不 `execve` 目标命令。
 - 理解 `--probe` 探测机制为什么要"真的施加一次最大化规则集"而不是只查内核版本号。
 - 搞清楚 full/partial enforcement 的区分依据,以及 Landlock 规则如何随 `execve` 继承、实现白名单式的安全模型。
@@ -17,29 +17,44 @@ dsh 的沙箱层（`packages/sandbox/sandbox-local`）需要在不同操作系�
 
 Landlock 是 Linux 5.13 引入的一个专门为"非特权自我限制"设计的 LSM(Linux Security Module)：任何进程都可以在不需要额外权限的情况下,给自己施加一个文件系统访问的白名单规则集,规则一旦施加就无法撤销,并且会随 `execve` 继承给后续所有子进程。这正好补上了 `bwrap` 权限不可用时的空白——它不如 `bwrap` 全面(目前只管文件系统访问),但足够轻、足够安全,可以作为一条无需特殊权限的备选沙箱路径。
 
-`native/landlock-run` 就是 dsh 为这条路径写的启动器。它的目录结构是：
+`native/system` 就是 dsh 为这条路径写的启动器。它的目录结构是：
 
 ```text
-native/landlock-run/
-├── docs/                    # cli-contract.md / architecture.md / naming.md / support-matrix.md / packaging.md
+native/system/
+├── docs/                    # cli-contract.md / architecture.md / naming.md / support-matrix.md / packaging.md / flock-contract.md
 ├── packages/
-│   ├── entry/                          # @deepseek-ai/node-addon-landlock-run,ESM JS 入口
-│   │   └── src/{main.c, index.ts}
-│   ├── linux-x64/                      # @deepseek-ai/node-addon-landlock-run-linux-x64,纯二进制包
-│   └── linux-arm64/                    # 同上,arm64
+│   ├── entry/                          # @deepseek-ai/node-addon-system,ESM JS 入口
+│   │   └── src/{main.c, index.ts, flock.c, flock.ts}
+│   ├── linux-x64/                      # @deepseek-ai/node-addon-system-linux-x64,纯二进制包(landlock-run + flock)
+│   ├── linux-arm64/                    # 同上,arm64
+│   ├── darwin-x64/                     # @deepseek-ai/node-addon-system-darwin-x64,只含 flock 的 N-API 二进制(macOS 没有 Landlock)
+│   └── darwin-arm64/                   # 同上,arm64
 ├── scripts/                 # 构建脚本
 └── test/                    # launcher.test.js / entry.test.js
 ```
 
+这个工作区原本叫 `native/landlock-run`,专门只做 Landlock 这一件事;仓库后来把它改名成了 `native/system`（commit `refactor(native): move Landlock workspace to native/system`,随后又是一次 `refactor(native): rename package family to node-addon-system`）,因为同一个包家族里新增了第二个能力——一个真正基于 Node-API 的异步 POSIX `flock` 绑定（`packages/entry/src/flock.c`/`flock.ts`）。两个能力通过 `package.json` 的 `exports` 字段拆成两个独立子路径,**不再有根导出**：
+
+```json
+// native/system/packages/entry/package.json
+"exports": {
+  "./landlock-run": { "types": "./lib/index.d.ts", "default": "./lib/index.js" },
+  "./flock": { "types": "./lib/flock.d.ts", "default": "./lib/flock.js" },
+  "./package.json": "./package.json"
+}
+```
+
+这意味着本篇后面所有 `import ... from '@deepseek-ai/node-addon-landlock-run'` 的写法都已经过时,现在必须显式导入 `./landlock-run` 子路径。
+
 全部沙箱逻辑压缩进唯一一个源码文件 `packages/entry/src/main.c`。这个设计选择本身就是一种安全声明——文件头注释写得很直接：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:30-35
+// native/system/packages/entry/src/main.c:30-35
  * Plain C11 over the raw Landlock UAPI — no libraries beyond libc (musl,
  * linked statically), so the whole audit surface is this file plus the
  * kernel's stable syscall contract. Built natively per architecture by
  * `scripts/build.ts` into the per-platform npm packages
- * (`@deepseek-ai/node-addon-landlock-run-linux-{x64,arm64}`); the argv grammar,
+ * (`@deepseek-ai/node-addon-system-linux-{x64,arm64}`); the argv grammar,
  * exit codes, and report lines are pinned in `docs/cli-contract.md`.
 ```
 
@@ -52,7 +67,7 @@ native/landlock-run/
 `main.c` 顶部只引入标准 libc 头文件,没有内核头:
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:38-48
+// native/system/packages/entry/src/main.c:38-48
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -69,7 +84,7 @@ native/landlock-run/
 Landlock 的结构体和常量是照抄内核头文件的布局,手写在源码里:
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:50-68
+// native/system/packages/entry/src/main.c:50-68
 /*
  * The Landlock UAPI, defined locally instead of via <linux/landlock.h>: the
  * kernel's user-space ABI is stable by contract, self-defining it keeps the
@@ -94,7 +109,7 @@ struct landlock_path_beneath_attr {
 系统调用号也是手写的回退定义,因为 Landlock 至今没有 libc 包装:
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:96-105
+// native/system/packages/entry/src/main.c:96-105
 /*
  * Landlock has no libc wrappers; these are the raw syscalls. The numbers are
  * identical on every architecture (the post-2011 unified table) — the
@@ -124,54 +139,65 @@ syscall(__NR_landlock_restrict_self, ruleset_fd, 0)
 
 ### 不是 N-API 绑定,是独立可执行文件 + 子进程调用
 
-`@deepseek-ai/node-addon-landlock-run` 这个包名带着"node-addon-"前缀,第一次看很容易误认为是 N-API/FFI 那种"编译进 Node 进程内存空间"的原生模块。实际情况完全不同——`main.c` 编译产出的是一个**独立的命令行可执行文件**,Node 侧只是用 `spawnSync`/`spawn` 去启动它,和调用 `bash`/`git` 没有本质区别。
+`@deepseek-ai/node-addon-system` 这个包名带着"node-addon-"前缀,第一次看很容易误认为是 N-API/FFI 那种"编译进 Node 进程内存空间"的原生模块。就 `landlock-run` 这一半而言,实际情况完全不同——`main.c` 编译产出的是一个**独立的命令行可执行文件**,Node 侧只是用 `spawnSync`/`spawn` 去启动它,和调用 `bash`/`git` 没有本质区别。
 
 `packages/entry/src/index.ts` 的导入只有这四个标准 Node 模块：
 
 ```ts
-// native/landlock-run/packages/entry/src/index.ts:16-19
+// native/system/packages/entry/src/index.ts:16-19
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 ```
 
-全文再也没有出现任何 `node:ffi`、`.node` 二进制加载、`process.binding`、`require('bindings')` 之类真正 N-API/addon 才会有的代码。真正解释这个命名来源的是 `docs/architecture.md`：
+全文再也没有出现任何 `node:ffi`、`.node` 二进制加载、`process.binding`、`require('bindings')` 之类真正 N-API/addon 才会有的代码（这一点在 `landlock-run` 子路径里依然成立）。`docs/architecture.md` 在改名合并之后被整体重写过一遍,不再逐字解释"node-addon-"这个命名前缀模仿的是哪个具体包（原文提到的 `node-addon-require-builtin`/esbuild 参照物已经被删掉,现在的措辞更泛化）,但对包结构的描述依然准确：
 
 ```text
-// native/landlock-run/docs/architecture.md:3
-consumers decide which paths a run may read or write; this package family
-provides the launcher that enforces those grants and the JavaScript API that
-resolves and speaks to it. The packaging follows the per-platform-package
-model of `node-addon-require-builtin` (and esbuild), adapted from Node
-addons to standalone static executables.
+// native/system/docs/architecture.md:3,7
+The system package family supplies native mechanisms to Node callers: a
+Linux confinement executable and a POSIX file-lock binding. Consumers own
+sandbox policy and Session lifecycle.
+
+The ESM package `@deepseek-ai/node-addon-system` and its optional platform
+packages share one version. Platform metadata chooses the operating system
+and CPU; each package's `prebuilds.json` declares the files it must contain.
 ```
 
-即：命名模式是照搬 `node-addon-require-builtin`/esbuild 那种"一个 JS 入口包 + 每平台一个二进制包"的分发结构,但作者自己特别注明"adapted from Node addons to standalone static executables"——沿用了打包命名习惯,但内容物已经从"进程内加载的原生模块"换成了"进程外的独立可执行文件"。平台包 `linux-x64/package.json` 的描述也写得很直白：
+也就是说,"一个 JS 入口包 + 若干个按 `os`/`cpu` 字段自动匹配的平台二进制包"这个分发结构本身完全没变,只是文档不再把它明确追溯到 `node-addon-require-builtin`/esbuild 这个具体范本——`landlock-run` 这部分内容物依然是"进程外的独立可执行文件",不是"进程内加载的原生模块"。平台包 `linux-x64/package.json` 的描述现在是（因为同一个平台包现在**同时**打包了 landlock-run 二进制和 flock 的 N-API addon,措辞也相应改了）：
 
 ```json
-// native/landlock-run/packages/linux-x64/package.json
-"description": "Prebuilt landlock-run Landlock launcher binary for linux-x64 (static musl) — resolved as a file path by @deepseek-ai/node-addon-landlock-run, never imported"
+// native/system/packages/linux-x64/package.json
+"description": "Linux x64 system binaries: static Landlock launcher and glibc/musl Node-API flock addons"
 ```
 
-"never imported"——它从未被 `require`/`import`,只是被当作一个文件路径字符串消费。`entry/package.json` 里用 `optionalDependencies` 声明了两个平台包：
+而 macOS 的平台包(`darwin-x64`/`darwin-arm64`)因为 Landlock 是 Linux 专属的 LSM,只打包了 flock 部分：
 
 ```json
-// native/landlock-run/packages/entry/package.json
+// native/system/packages/darwin-arm64/package.json
+"description": "Prebuilt POSIX flock Node-API binding for macOS arm64"
+```
+
+`entry/package.json` 里用 `optionalDependencies` 声明了四个平台包,而不是最初只有 Linux 时的两个：
+
+```json
+// native/system/packages/entry/package.json
 "optionalDependencies": {
-  "@deepseek-ai/node-addon-landlock-run-linux-arm64": "workspace:*",
-  "@deepseek-ai/node-addon-landlock-run-linux-x64": "workspace:*"
+  "@deepseek-ai/node-addon-system-darwin-arm64": "workspace:*",
+  "@deepseek-ai/node-addon-system-darwin-x64": "workspace:*",
+  "@deepseek-ai/node-addon-system-linux-arm64": "workspace:*",
+  "@deepseek-ai/node-addon-system-linux-x64": "workspace:*"
 }
 ```
 
-npm 的 `os`/`cpu` 字段（平台包里声明为 `"os": ["linux"]`、`"cpu": ["x64"]`）在安装期就会自动只装匹配当前平台的那一个,不匹配的平台包不会落地。运行时,`launcherPath()` 用 `require.resolve` 去找当前平台对应的包,再拼出二进制路径：
+npm 的 `os`/`cpu` 字段（平台包里声明为 `"os": ["linux"]`、`"cpu": ["x64"]` 之类）在安装期就会自动只装匹配当前平台的那一个,不匹配的平台包不会落地。运行时,`launcherPath()` 用 `require.resolve` 去找当前平台对应的包,再拼出二进制路径——这个函数本身并不区分"这台机器到底有没有 landlock-run 二进制",在 darwin 上它一样会拼出一个 `bin/landlock-run` 路径,只是这个路径实际上并不存在（darwin 平台包只打包了 flock 的 `.node` 文件),后面会讲到 `probe()` 正是靠"这个文件根本不存在/执行失败"这件事,把这种情况诚实地归类成 `unusable`，不需要 `launcherPath()` 自己去做平台特判：
 
 ```ts
-// native/landlock-run/packages/entry/src/index.ts:69-83
+// native/system/packages/entry/src/index.ts:69-83
 export function launcherPath(
   resolvePackageJson: (specifier: string) => string = createRequire(import.meta.url).resolve,
 ): string {
-  const platformPackage = `@deepseek-ai/node-addon-landlock-run-${process.platform}-${process.arch}`
+  const platformPackage = `@deepseek-ai/node-addon-system-${process.platform}-${process.arch}`
   try {
     return join(dirname(resolvePackageJson(`${platformPackage}/package.json`)), 'bin', LAUNCHER_BIN)
   } catch {
@@ -188,7 +214,7 @@ export function launcherPath(
 这里的注释同样值得留意:回退路径特意选择"绝对路径、包边界之内",而不是任何 cwd 相关的路径——因为"哪个二进制来限制这个进程"这个决定,绝不能受调用时的当前目录影响。整个模块的头部注释把这个原则说得更绝：
 
 ```ts
-// native/landlock-run/packages/entry/src/index.ts:12-15
+// native/system/packages/entry/src/index.ts:12-15
  * Deliberately no environment-variable overrides anywhere in this module:
  * which binary confines a process must never be decidable by the ambient
  * environment. Test injection is by function parameter.
@@ -201,7 +227,7 @@ export function launcherPath(
 `docs/cli-contract.md` 把整个命令行协议钉死为：
 
 ```text
-// native/landlock-run/docs/cli-contract.md:7-18
+// native/system/docs/cli-contract.md:7-18
 landlock-run [--ro <path>]... [--rw <path>]... -- <argv>...
 landlock-run --probe
 
@@ -218,7 +244,7 @@ landlock-run --probe
 对应的 C 侧解析逻辑是手写的,四个 flag 不值得引入解析库：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:142-182(节选)
+// native/system/packages/entry/src/main.c:142-182(节选)
 /*
  * Hand-rolled argv parsing — four flags do not justify a parsing library.
  * Returns 0 on success, else the process exit code (message already printed).
@@ -253,7 +279,7 @@ static int parse(int argc, char **argv, struct cli *cli) {
 JS 侧的 `grantArgs()` 只是把 `{ readOnly, readWrite }` 对象拼成对应的 flag 数组,不做任何路径校验(校验和拒绝的责任在 C 二进制里)：
 
 ```ts
-// native/landlock-run/packages/entry/src/index.ts:94-99
+// native/system/packages/entry/src/index.ts:94-99
 export function grantArgs(grants: LauncherGrants): string[] {
   return [
     ...(grants.readOnly ?? []).flatMap(root => ['--ro', root]),
@@ -265,7 +291,7 @@ export function grantArgs(grants: LauncherGrants): string[] {
 `test/entry.test.js` 里锁死了拼接顺序（只读参数在前,读写在后,与调用者传参顺序无关）：
 
 ```js
-// native/landlock-run/test/entry.test.js:24-31
+// native/system/test/entry.test.js:24-31
 assert.deepEqual(grantArgs({}), []);
 assert.deepEqual(grantArgs({ readOnly: ['/'] }), ['--ro', '/']);
 assert.deepEqual(
@@ -274,11 +300,12 @@ assert.deepEqual(
 );
 ```
 
-真正跑沙箱的一方(比如 `packages/sandbox/sandbox-local`)把 `[launcherPath(), ...grantArgs(...), '--', ...实际命令]` 拼成一整条 argv,交给自己的进程管理器 `spawn`——`landlock-run` 只是这条 argv 数组第一个位置的可执行文件,和普通命令没有任何特殊之处。README 给出的最简用法印证了这一点：
+真正跑沙箱的一方(比如 `packages/sandbox/sandbox-local`)把 `[launcherPath(), ...grantArgs(...), '--', ...实际命令]` 拼成一整条 argv,交给自己的进程管理器 `spawn`——`landlock-run` 只是这条 argv 数组第一个位置的可执行文件,和普通命令没有任何特殊之处。改名合并成 `native/system` 之后,`README.md` 已经不再给这三个函数写一段可直接复制的代码示例（现在是纯 Prose 式的"Use"小节,只说"`@deepseek-ai/node-addon-system/landlock-run` exports `launcherPath`、`probe`、`grantArgs`"）,但这三个函数本身、以及它们的行为,都还和之前完全一致,把子路径改对就是等价的最简用法：
 
 ```js
-// native/landlock-run/README.md:27-35
-import { grantArgs, launcherPath, probe } from '@deepseek-ai/node-addon-landlock-run';
+// 等价示例,依据 native/system/packages/entry/src/index.ts 当前真实导出改写
+// (README.md 已改为纯文字说明,不再给这段代码)
+import { grantArgs, launcherPath, probe } from '@deepseek-ai/node-addon-system/landlock-run';
 
 const launcher = launcherPath();
 if (probe(launcher) !== 'unusable') {
@@ -292,7 +319,7 @@ if (probe(launcher) !== 'unusable') {
 内核支持 Landlock 语义(有没有编译进这个 LSM、有没有被启用)不能靠 uname 或版本号猜测——同一个版本号的内核,可能因为编译选项或 `CONFIG_SECURITY_LANDLOCK` 被关闭而完全不支持。`--probe` 的做法是老老实实走一遍完整流程：用 `--ro /` 构建一个覆盖全盘的规则集,真的对当前(即将退出的)探测进程施加限制,看内核会不会真的接受：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:269-283
+// native/system/packages/entry/src/main.c:269-283
 if (cli.probe) {
   /* The functional probe: build and enforce a maximal ruleset in THIS
    * short-lived process (the probe run exits right after). `--version`
@@ -313,7 +340,7 @@ if (cli.probe) {
 注释里的理由很关键:"版本号式检查会漏掉内核有 syscall 但拒绝执行 enforcement 的情况——真的去限制一次才是唯一诚实的信号"。这一行 stdout 输出是协议的一部分,`index.ts` 的 `probe()` 函数直接用正则去解析它：
 
 ```ts
-// native/landlock-run/packages/entry/src/index.ts:116-127
+// native/system/packages/entry/src/index.ts:116-127
 export function probe(
   launcher: string = launcherPath(),
   options: { timeoutMs?: number } = {},
@@ -335,7 +362,7 @@ export function probe(
 任何"启动器级"失败(参数错误、内核不支持、规则路径打不开、施加规则失败)都必须在还没跑到 `execvp` 之前返回,并且要用一个和被包装命令自身退出码"几乎不可能撞车"的固定退出码,让外层调用方能明确区分"是启动器失败"还是"是被包装的命令自己失败了"：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:107-112
+// native/system/packages/entry/src/main.c:107-112
 /*
  * Every fatal launcher error prints `landlock-run: <message>` to stderr
  * and exits 125 — a code the wrapped command itself is unlikely to use, so
@@ -347,7 +374,7 @@ export function probe(
 内核完全不支持 Landlock 时(`ENOSYS`/`EOPNOTSUPP`)的处理是直接拒绝,注释直接写明了这是"宁可不跑,也不裸奔"的原则：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:230-236
+// native/system/packages/entry/src/main.c:230-236
 static int restrict_self(const struct cli *cli, int *partial) {
   long abi = syscall(__NR_landlock_create_ruleset, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
   if (abi < 0) {
@@ -361,7 +388,7 @@ static int restrict_self(const struct cli *cli, int *partial) {
 某条授权路径本身打不开(比如调用方传了个不存在的目录)也是同样的处理方式,哪怕"悄悄缩小授权范围"看起来是安全的,也不采纳这个选项：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:194-202
+// native/system/packages/entry/src/main.c:194-202
 static int add_rule(int ruleset_fd, const char *path, uint64_t access) {
   int path_fd = open(path, O_PATH | O_CLOEXEC);
   if (path_fd < 0) {
@@ -377,7 +404,7 @@ static int add_rule(int ruleset_fd, const char *path, uint64_t access) {
 `main()` 的主流程严格按"每一步失败就直接 return,永远不往下走"的方式串联,只有全部成功才会到达最后一行的 `execvp`：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:295-297
+// native/system/packages/entry/src/main.c:295-297
 execvp(cli.command[0], cli.command);
 /* exec only returns on failure. */
 return fail("exec failed", strerror(errno));
@@ -386,7 +413,7 @@ return fail("exec failed", strerror(errno));
 `test/launcher.test.js` 用一个真实的失败场景做了断言,证明"命令永远不会落地"不是空话：
 
 ```js
-// native/landlock-run/test/launcher.test.js:127-135
+// native/system/test/launcher.test.js:127-135
 // --- fail closed: an unopenable grant root refuses to exec at all ---
 {
   const marker = path.join(os.tmpdir(), `nalr-should-not-exist-${process.pid}`);
@@ -422,7 +449,7 @@ const RUNNER_FAILURE_RULES = {
 Landlock 是一个持续演进的 LSM,每个新的内核 ABI 版本会新增可治理的文件系统访问类型(比如 ABI 2 加了 `LANDLOCK_ACCESS_FS_REFER`,ABI 3 加了 truncate 治理,ABI 5 加了设备 ioctl 治理)。`landlock-run` 在协商阶段会问内核"你支持到哪一版",然后把规则集缩到内核实际能治理的子集,而不是要求"全有或全无"：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:90-94
+// native/system/packages/entry/src/main.c:90-94
 /*
  * Newest ABI this build knows; the negotiation below scales the actual
  * ruleset down to what the running kernel supports.
@@ -431,7 +458,7 @@ Landlock 是一个持续演进的 LSM,每个新的内核 ABI 版本会新增可�
 ```
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:184-191
+// native/system/packages/entry/src/main.c:184-191
 /* The filesystem accesses the running kernel's ABI can govern. */
 static uint64_t fs_mask_for_abi(long abi) {
   uint64_t mask = LL_ABI1_MASK;
@@ -445,13 +472,13 @@ static uint64_t fs_mask_for_abi(long abi) {
 协商出的 `abi` 一旦小于 `MAX_ABI`,`*partial` 就被标记为真,但这不是失败,只是降级——规则集依然会被施加,只是范围比"最新 ABI 能治理的全集"小一点：
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:237-238
+// native/system/packages/entry/src/main.c:237-238
 *partial = abi < MAX_ABI;
 uint64_t handled = fs_mask_for_abi(abi < MAX_ABI ? abi : MAX_ABI);
 ```
 
 ```c
-// native/landlock-run/packages/entry/src/main.c:285-293
+// native/system/packages/entry/src/main.c:285-293
 int partial = 0;
 code = restrict_self(&cli, &partial);
 if (code != 0) return code;
@@ -463,17 +490,19 @@ if (partial) {
 }
 ```
 
-`docs/support-matrix.md` 把这套判据总结成了一句话,同时强调"探测结果本身才是权威,内核版本号不是"：
+`docs/support-matrix.md` 同样把"探测结果本身才是权威,内核版本号不是"这条原则保留了下来,只是随着这次改名/合并把措辞改得更简练（原来单独一句话,现在拆成了两句,并且顺带把 darwin 平台也列进了矩阵——但 darwin 只是拿到了 flock 的 Node-API addon,并不代表 macOS 上有了 Landlock 支持,Landlock 依然是纯 Linux 能力）：
 
 ```text
-// native/landlock-run/docs/support-matrix.md:9
-Enforcement additionally requires a kernel with Landlock enabled (5.13+). The
-negotiated ABI level decides the probe verdict: every access this build knows
-governed → `full`; an older ABI governing a subset → `partial` (still
-confined for everything it supports); Landlock absent or disabled →
-`unusable`, and the launcher refuses to run commands at all. The probe — not
-the kernel version — is the authority: a kernel built without Landlock, or
-with the LSM disabled, probes `unusable` regardless of its version.
+// native/system/docs/support-matrix.md:10-12
+Landlock additionally requires an enforcing Linux kernel. The functional
+probe determines full, partial, or unusable enforcement; kernel version
+alone is not an availability guarantee.
+
+Windows has neither a Landlock launcher nor this POSIX addon. The Harness
+retains its existing Windows semaphore implementation. Other CPU/OS
+combinations have no published platform package: Landlock probes unusable,
+and flock acquisition rejects. New platform support requires a native
+builder and installed-artifact verification.
 ```
 
 ### 白名单模型与 `execve` 继承
@@ -481,7 +510,7 @@ with the LSM disabled, probes `unusable` regardless of its version.
 `docs/cli-contract.md` 最后一段直接点明了这个沙箱的两个安全支柱：
 
 ```text
-// native/landlock-run/docs/cli-contract.md:32-34
+// native/system/docs/cli-contract.md:32-34
 ## Confinement semantics
 
 The launcher sets `no_new_privs`, installs the ruleset on itself, and `exec`s
@@ -496,7 +525,7 @@ running ABI are not governed and are the difference between `full` and
 - **规则随 `execve` 继承**：`landlock_restrict_self` 施加在调用进程自身之后,只要接下来走 `execvp`,新进程映像继承同一份限制,而且这份限制**无法被子进程自己撤销**——`test/launcher.test.js` 里专门有一个"嵌套子进程也被限制"的用例验证这一点：
 
 ```js
-// native/landlock-run/test/launcher.test.js:117-122
+// native/system/test/launcher.test.js:117-122
 // The ruleset is inherited across execve: a CHILD of the wrapped command
 // is confined too, not just the direct exec target.
 const nested = path.join(work, 'nested.txt');
@@ -536,7 +565,7 @@ const PLATFORM_CHAINS: Record<string, readonly SelectedRunner['runner'][]> = {
 Linux 上 `bwrap` 排在 `landlock` 之前——只有 `bwrap` 探测不可用(权限不足、二进制不存在)时,才会降级尝试 `landlock`。真正拼出 argv 的地方,Landlock 分支就是本篇反复出现的 `[launcherPath(), ...grantArgs(...)]` 模式：
 
 ```ts
-// packages/sandbox/sandbox-local/src/index.ts:336-344(节选)
+// packages/sandbox/sandbox-local/src/index.ts:339-347(节选)
 private runnerArgv(runner: SelectedRunner['runner'], policy: SandboxPolicy): string[] {
   switch (runner) {
     case 'bwrap': return ['bwrap', ...bwrapProfileArgs(policy)]
@@ -551,7 +580,7 @@ private runnerArgv(runner: SelectedRunner['runner'], policy: SandboxPolicy): str
 选择 `landlock` 分支前,会先跑一次探测,复用的正是本篇讲过的 `probe()`：
 
 ```ts
-// packages/sandbox/sandbox-local/src/index.ts:524-527(节选)
+// packages/sandbox/sandbox-local/src/index.ts:528-531(节选)
 case 'landlock': {
   const probe = this.internals.probeLandlock ?? (launcher => defaultProbeLandlock(launcher, { timeoutMs: this.probeTimeoutMs }))
   return probe(this.landlockLauncher())

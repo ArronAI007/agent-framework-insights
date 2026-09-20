@@ -7,7 +7,7 @@
 - 理解 agent 测试相对传统软件测试多出的那个陷阱:被测系统(LLM)可以自己生成一段以假乱真的"成功报告",单靠这段报告做断言等于让考生自己判卷。
 - 理解 DeepSeek Harness 为什么坚持"不要吝惜真实 API 测试"(`We are DeepSeek — do not ration real-API tests`),以及这条策略与"只 mock 昂贵或不确定的边界"这条克制原则之间并不矛盾。
 - 搞清楚这个项目的测试分层(单元 / 覆盖率门禁 / 真实 API e2e / 快照 / Web 浏览器快照)各自能证明什么、不能证明什么,理解为什么它们不能互相替代。
-- 通过真实测试文件 `examples/headless-agent/tests/coding-task.e2e.ts` 理解"验证外部世界,而非自我报告"这条规则在代码层面具体怎么写。
+- 通过真实测试文件 `apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts` 理解"验证外部世界,而非自我报告"这条规则在代码层面具体怎么写。
 - 理解"测试真实入口路径"规则如何专门堵住"手工搭建的插件测试全绿、真实产品在生产环境秒崩"这一类回归,并能复述 postmortem 0001 里这个故事的具体细节。
 - 理解覆盖率门禁的本质边界:它只能证明代码行被执行过,不能证明功能按交付方式正常工作。
 
@@ -63,10 +63,10 @@ DeepSeek Harness 用一次真实事故把这个抽象问题变成了具体教训
 
 "关键词探测(keyword probe)"指的是这样一种写法:agent 跑完一轮对话后,拿到它最后一条回复的文本,搜索里面是否出现"成功""fixed""done"之类的词,把这个搜索结果当作测试断言。这种写法的问题在于,它把"模型说了什么"和"世界发生了什么"这两件事等同起来——而这正是 agent 系统区别于传统程序的地方:模型的输出**本身就是被测的一部分**,不能同时充当"证据"和"结论"。规则给出的解决办法很直接:e2e 断言必须外部地(在测试代码里,独立于 agent 的任何输出)重新运行命令或重新读取文件,拿这个独立观测到的结果做断言;对于"不应该被改动的文件",要断言它们逐字节一致——防止 agent 通过篡改测试本身而不是修复 bug 来"通过"任务。
 
-我们可以在一个真实文件里看到这条规则从"哲学"变成"代码"的过程。`examples/headless-agent/tests/coding-task.e2e.ts` 是一个 SWE-bench 风格的冒烟测试:让真实模型在一个临时目录里,只用 bash 工具修复一个真实的 bug,而修复结果**在 agent 之外**通过重新运行测试脚本来验证。文件开头的注释已经把这条原则写死在意图里:
+我们可以在一个真实文件里看到这条规则从"哲学"变成"代码"的过程。**这个文件的路径相对课程写作时变了**(原来在 `examples/headless-agent/tests/`,现在挪到了 `apps/cli/tests/profiles/headless/tests/`——独立的 `examples/*` 顶层目录被收编进了 `apps/cli` 下的测试 profile 体系),但内容和断言逐行核对下来没有变化。`apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts` 是一个 SWE-bench 风格的冒烟测试:让真实模型在一个临时目录里,只用 bash 工具修复一个真实的 bug,而修复结果**在 agent 之外**通过重新运行测试脚本来验证。文件开头的注释已经把这条原则写死在意图里:
 
 ```typescript
-// examples/headless-agent/tests/coding-task.e2e.ts
+// apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts
 /**
  * The swebench-style smoke test: a real model fixes a real bug in a temp
  * directory using only the bash tool, and the fix is verified OUTSIDE the
@@ -77,7 +77,7 @@ DeepSeek Harness 用一次真实事故把这个抽象问题变成了具体教训
 测试的核心断言部分是这样写的:
 
 ```typescript
-// examples/headless-agent/tests/coding-task.e2e.ts
+// apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts
 // The agent claims success…
 const summary = finalText([...agent.session.events]).toLowerCase()
 expect(summary.length).toBeGreaterThan(0)
@@ -108,7 +108,7 @@ expect(fixed).not.toMatch(/a\s*-\s*b/)
 这条规则还带出一个容易被忽略的资源管理约定:"e2e tests own their resources: create the harness in the test, dispose in `afterEach` … shared fixtures live in a plain `tests/harness.ts`, never another `*.e2e.ts`"。`coding-task.e2e.ts` 里的 `afterEach` 精确对应这条约定:
 
 ```typescript
-// examples/headless-agent/tests/coding-task.e2e.ts
+// apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts
 afterEach(async () => {
   // Dispose the harness even on failure/retry: agent-loop teardown stops the
   // loop and LocalBashExecutor teardown kills anything the model left running.

@@ -8,8 +8,8 @@
 - 掌握 `@Remote`/`@RemoteScope` 两个装饰器的语义差异,以及它们各自解决什么样的调用场景。
 - 搞清楚 Typert 四个子包(`generator`/`registry`/`protocol`/`loader`)各自的职责边界,以及它们在构建期和运行期分别扮演什么角色。
 - 理解 Typert Gateway 是如何和已有的 API Proxy 共存的——两者按 endpoint 是否有 Remote 描述符分流。
-- 理清"会话事件推送"这条平行链路(`FrameQueue` → `mux()` → WebSocket)与 Typert RPC 调用链路的关系:它们共享底层 Connection,但是两套独立的协议。
-- 能把第 04 章讲过的 `assistant/chunk` 等会话事件,和这里的推送链路对应起来,理解事件从 agent-loop 内部一路走到浏览器的完整路径。
+- 理解流式推送现在也被纳入了 Typert 本身——`@Remote({ mode: 'stream' })` 是和 `@Remote('name')`/`@RemoteScope` 并列的第三种调用形态,方法返回一个 `AsyncIterable`,由 Gateway 逐帧转发给 Client,不再需要一套独立于 Typert 之外的推送协议。
+- 能把第 04 章讲过的会话事件流,和这里 `SessionController.follow()`/`control()` 这类流式 Remote 方法对应起来,理解事件从 agent-loop 内部一路走到浏览器的完整路径。
 
 ## 背景与设计动机
 
@@ -176,7 +176,7 @@ contributions without starting Typert again.
 也就是说,Typert 只在编译 Host 那一次运行,拿到完整的 `ts.Program` 作为分析入口;Client 那一次编译只是消费上一步已经生成好的产物,不会重复跑分析。真正识别 `@Remote`/`@RemoteScope` 装饰器的核心逻辑在 `packages/typert/generator/src/analyzer.ts` 的 `remoteMarker()` 方法里,用 TS Compiler API 检查每个类成员上的装饰器表达式：
 
 ```ts
-// packages/typert/generator/src/analyzer.ts:1215-1260(节选)
+// packages/typert/generator/src/analyzer.ts:1308-1349(节选,当前版本比课程原写作时多了一段专门解析 `mode: 'stream'` 选项对象的分支)
 private remoteMarker(member: ts.ClassElement) {
   let found: ...
   for (const decorator of ts.canHaveDecorators(member) ? ts.getDecorators(member) ?? [] : []) {
@@ -186,12 +186,21 @@ private remoteMarker(member: ts.ClassElement) {
       marker = { kind: 'direct' }
     } else if (ts.isCallExpression(expression)
       && this.isTypeMetaSymbol(expression.expression, 'Remote')) {
-      if (expression.arguments.length !== 1) this.fail(expression, 'Remote() requires one exported method name')
-      const exportName = stringLiteralValue(expression.arguments[0])
-      if (exportName === undefined || !isRemoteSegment(exportName)) {
-        this.fail(expression.arguments[0] ?? expression, 'Remote() name must be a string literal containing only RPC endpoint segment characters')
+      if (expression.arguments.length !== 1) this.fail(expression, 'Remote() requires one name or options object')
+      const argument = expression.arguments[0]
+      const exportName = stringLiteralValue(argument)
+      if (exportName !== undefined) {
+        if (!isRemoteSegment(exportName)) this.fail(argument, 'Remote() name must contain only RPC endpoint segment characters')
+        marker = { kind: 'direct', exportName }
+      } else {
+        // 参数不是字符串字面量,就必须是形如 `{ mode: 'stream' }` 的选项对象——
+        // 严格要求"只有这一个 key、值只能是字符串字面量 'stream'"
+        if (!ts.isObjectLiteralExpression(argument) || argument.properties.length !== 1) {
+          this.fail(argument, 'Remote() options must contain exactly mode: "stream"')
+        }
+        // ...校验唯一属性名是 mode、值是字符串字面量 'stream'...
+        marker = { kind: 'direct', mode: 'stream' }
       }
-      marker = { kind: 'direct', exportName }
     } else if (ts.isCallExpression(expression)
       && this.isTypeMetaSymbol(expression.expression, 'RemoteScope')) {
       // ...解析 RemoteScope(context, exportName?) 的参数
@@ -206,10 +215,10 @@ private remoteMarker(member: ts.ClassElement) {
 }
 ```
 
-这里能看到几个"严格分析"的约束落地:装饰器参数必须是字符串字面量,而且只能包含合法的 RPC endpoint 片段字符;同一个方法上不能同时出现两个 Remote 相关装饰器。扫描的入口 `collectInvocations()` 遍历每个可达源文件里的每个类声明,逐方法调用 `remoteMarker()`,一旦发现方法被标记就进一步校验它必须是`public`、非 `static`、有实现体、非泛型：
+`@Remote({ mode: 'stream' })` 是这次架构收敛新增的第三种调用形态——它和 `@Remote('name')` 共享同一个 `kind: 'direct'` 标记(都是"直接从根 Context 拿服务实例"这条语义),只是多带一个 `mode: 'stream'` 字段,告诉后续的生成器和 Gateway"这个方法返回的是一个 `AsyncIterable`,要按流式帧转发,而不是等它 resolve 出一个值再一次性返回"。这里能看到几个"严格分析"的约束落地:装饰器参数必须是字符串字面量或者形如 `{ mode: 'stream' }` 的选项对象,不接受别的形状;同一个方法上不能同时出现两个 Remote 相关装饰器。扫描的入口 `collectInvocations()` 遍历每个可达源文件里的每个类声明,逐方法调用 `remoteMarker()`,一旦发现方法被标记就进一步校验它必须是`public`、非 `static`、有实现体、非泛型：
 
 ```ts
-// packages/typert/generator/src/analyzer.ts:941-972(节选)
+// packages/typert/generator/src/analyzer.ts:1032-1063(节选,行号随文件从约 1260 行增长到 3236 行而整体后移,逻辑本身未变)
 private collectInvocations(registration, reachable) {
   const result: InvocationModel[] = []
   for (const sourceFile of reachable) {
@@ -256,7 +265,7 @@ private collectInvocations(registration, reachable) {
 `packages/typert/registry` 是运行期在 Host 侧承接生成产物的地方。核心类 `TypertRegistry` 通过 `register()` 方法原子地注册一个包的 schema、反射信息和调用描述符,借助 Cordis 的 `ctx.effect` 让整批注册跟随插件生命周期一起撤销：
 
 ```ts
-// packages/typert/registry/src/service.ts:499-520
+// packages/typert/registry/src/service.ts:500-521(行号后移,逻辑与两处 /* v8 ignore else */ 覆盖率注释外的内容完全一致)
 register(contribution: TypertContribution): TypertDisposer {
   const packageRecord = this.validatePackage(contribution)
   const schemaRecords = this.validateSchemas(contribution)
@@ -282,8 +291,8 @@ register(contribution: TypertContribution): TypertDisposer {
 `toJSONSchema()` 把注册进来的 Zod schema 投影成标准 JSON Schema,供请求/返回值校验之外的场景复用：
 
 ```ts
-// packages/typert/registry/src/service.ts:587-589
-toJSONSchema(key, params) {
+// packages/typert/registry/src/service.ts:589-590
+toJSONSchema(key: string, params?: z.core.ToJSONSchemaParams) {
   return z.toJSONSchema(this.resolve(key).schema, params)
 }
 ```
@@ -295,43 +304,78 @@ toJSONSchema(key, params) {
 `packages/api/gateway` 里的 `TypertGatewayService` 是编译期产物在运行期真正发挥作用的地方。它在 Connection 层拦截 `/api` 路径下的请求：
 
 ```ts
-// packages/api/gateway/src/index.ts:90-112(节选)
+// packages/api/gateway/src/index.ts:169-204(节选,构造函数现在同时挂载了两条通路)
 export class TypertGatewayService extends Service implements TypertGateway {
   static inject = ['typert']
-  constructor(ctx: Context) {
+
+  private srcClaims: ReadonlySet<string> | undefined
+  private remoteEvents: RegisteredRemoteEventSource | undefined
+  private readonly remoteEventClients = new Map<RemoteEventClientId, RemoteEventClient>()
+
+  constructor(ctx: Context, config: Config) {
     super(ctx, 'typertGateway')
     ctx.inject(['connection'], (connectionCtx) => {
       connectionCtx.connection.rpc.intercept(
         '/api',
         endpoint => this.claimsEndpoint(endpoint),
         (endpoint, payload, signal) => this.dispatchRpc(endpoint, payload, signal),
-        { authority: 'trusted-host' },
       )
+    })
+    ctx.inject(['connection', 'webServer'], (webCtx) => {
+      // 单独开一条 WebSocket upgrade 路由,承载所有 `mode: 'stream'` 的 Remote 方法
+      const mux = new RemoteStreamMuxServer(
+        (endpoint, payload, signal) => this.openWireStream(endpoint, payload, signal),
+        this.wireStream.failure,
+        resolved.websocketHeartbeatIntervalMs,
+      )
+      // ...把 mux 挂到 REMOTE_STREAM_MUX_PATH 这个 WebUpgradeRoute 上...
     })
   }
 ```
 
-真正执行一次调用的 `invoke()` 方法,把"解析描述符 → 校验参数 → 解析身份/Context → 反射调用业务方法 → 校验返回值"这五步串起来：
+普通的一问一答调用走 `/api` 这条 HTTP intercept 路径;而流式 Remote 方法(`mode: 'stream'`)现在直接是 Gateway 自己内建的一条 WebSocket 通路——`RemoteStreamMuxServer`,不再是课程更早版本描述的那套独立于 Typert 之外、挂在 `packages/host/apiproxy` 里的 `FrameQueue`/`mux()`/`WebSocketDownlinks` 三件套(那几个类和它们所在的包已经不存在了)。真正执行一次调用的逻辑被拆成了两半:`prepareInvocation()` 负责"解析描述符 → 校验参数 → 解析身份/Context → 找到可调用的方法",`invoke()`(一问一答)和 `stream()`(流式)各自只负责按 `descriptor.mode` 分流调用:
 
 ```ts
-// packages/api/gateway/src/index.ts:145-184(节选)
-async invoke(request: InvokeRemoteRequest): Promise<unknown> {
+// packages/api/gateway/src/index.ts:597-621(节选)——prepareInvocation():两条路径共用的准备阶段
+private async prepareInvocation(request: InvokeRemoteRequest): Promise<PreparedInvocation> {
   const endpoint = endpointOf(request.namespace, request.method)
   const descriptor = this.resolveDescriptor(request.namespace, request.method, endpoint)
   assertExactArguments(request.args, descriptor, endpoint)
   const receiverContext = await this.resolveReceiverContext(descriptor, request.args, endpoint)
   const receiver = receiverContext.get(descriptor.service) as unknown
+  // ...校验 receiver 存在、校验 binding...
   const args = await Promise.all(descriptor.parameters.map(parameter =>
     this.resolveParameter(parameter, request.args, endpoint)))
   if (descriptor.cancellation !== undefined) args.push(request.signal ?? NEVER_ABORTED_SIGNAL)
   const implementation = descriptor.implementation ?? descriptor.method
   const method = Reflect.get(receiver, implementation) as unknown
-  const result = await Reflect.apply(method, receiver, args) as unknown
-  return decode(descriptor.result, result, 'result-invalid', endpoint, 'result')
+  // ...校验 method 是函数...
+  return { endpoint, descriptor, receiver, args, method: method as (...args: never[]) => unknown }
 }
 ```
 
-`resolveReceiverContext` 这一步就是 `@Remote` 和 `@RemoteScope` 两种语义分叉的地方:前者直接从根 Context 拿服务实例,后者先经过 `ctx.typert.contexts` 解析出 Scoped Context 再取服务。而 `Reflect.get`/`Reflect.apply` 这两行,就是"编译期生成的描述符"最终变成"运行期真实方法调用"的落点——描述符里记录的 `service`/`implementation` 字段告诉 Gateway 该去哪个服务、调哪个方法,而不需要为每个 Remote 方法手写一段 dispatch 代码。
+```ts
+// packages/api/gateway/src/index.ts:298-330(节选)——invoke() 和 stream() 按 mode 互斥分流
+async invoke(request: InvokeRemoteRequest): Promise<unknown> {
+  const prepared = await this.prepareInvocation(request)
+  if (prepared.descriptor.mode === 'stream') {
+    throw new TypertGatewayError('gateway/signature-invalid', prepared.endpoint,
+      'stream Remote methods must be opened through the stream carrier')
+  }
+  return await Reflect.apply(prepared.method, prepared.receiver, prepared.args) as unknown
+}
+
+async stream(request: InvokeRemoteRequest): Promise<AsyncIterable<unknown>> {
+  const prepared = await this.prepareInvocation(request)
+  if (prepared.descriptor.mode !== 'stream') {
+    throw new TypertGatewayError('gateway/signature-invalid', prepared.endpoint,
+      'unary Remote methods cannot be opened through the stream carrier')
+  }
+  // ...把 prepared.method 返回的 AsyncIterable 接到 wire stream 上...
+}
+```
+
+`resolveReceiverContext` 这一步依然是 `@Remote` 和 `@RemoteScope` 两种语义分叉的地方:前者直接从根 Context 拿服务实例,后者先经过 `ctx.typert.contexts` 解析出 Scoped Context 再取服务。而 `Reflect.get`/`Reflect.apply` 这两行,依然是"编译期生成的描述符"最终变成"运行期真实方法调用"的落点——描述符里记录的 `service`/`implementation` 字段告诉 Gateway 该去哪个服务、调哪个方法,而不需要为每个 Remote 方法手写一段 dispatch 代码。互斥校验(`invoke()` 拒绝 `mode: 'stream'` 描述符,`stream()` 拒绝非流式描述符)保证了"这个方法到底是一问一答还是持续推流"这件事,在编译期由装饰器决定、在运行期由 Gateway 强制,调用方不可能张冠李戴。
 
 Client 侧对称地消费同一份生成产物,`ctx.remote.<namespace>.<method>()` 这样的调用最终落到 Connection 的 RPC 层：
 

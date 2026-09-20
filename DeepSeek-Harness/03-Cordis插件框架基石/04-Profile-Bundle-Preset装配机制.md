@@ -68,30 +68,51 @@ dsh 用两套独立但呼应的机制分别解决这两个层面的问题：**Bu
         model: deepseek-v4-flash
 ```
 
-这份文件本身不做任何事情——它只是数据，一份"我要插入哪些行"的清单。dsh 目前自带三个 Bundle，`packages/bundle/README.md` 用一张表说明了它们的分工：
+这份文件本身不做任何事情——它只是数据，一份"我要插入哪些行"的清单。dsh 目前自带六个 Bundle（相比早期版本新增了 `acp-app`、`sdk-app`、`sdk-minimal` 三个，对应 ACP 自动化协议和 SDK JSON-RPC 这两类新的部署形态），`packages/bundle/README.md` 用一张表说明了它们的分工：
 
 | Package | Role | ctx key |
 |---|---|---|
-| `base/` | The shared dsh core every profile applies first | — (patch only) |
-| `web-app/` | Browser surface: web patch layer + runtime glue plugin | mounts rows |
-| `headless/` | Direct one-shot task mode over base, with no Host or Web layer | mounts `headless-runner` |
+| `base/` | Shared core for base-backed profiles | — (patch only) |
+| `acp-app/` | Automation-only ACP stdio application over base | mounts the ACP bridge |
+| `web-app/` | Browser application layer over base | mounts Web rows |
+| `headless/` | One-shot command-line task application over base | `headless-runner` |
+| `sdk-app/` | SDK JSON-RPC stdio application over base | mounts the SDK server |
+| `sdk-minimal/` | Standalone minimal SDK application without base or Web | — (complete patch tree) |
 
-一个 Bundle 只关心"我要往树里插入哪些行"，完全不关心自己会被安装进哪个 Profile、和哪些其他 Bundle 叠在一起——这正是它能被复用的原因：`dsh-base` 这份补丁同时是 `web` Profile 和 `headless` Profile 的第一层。
+一个 Bundle 只关心"我要往树里插入哪些行"，完全不关心自己会被安装进哪个 Profile、和哪些其他 Bundle 叠在一起——这正是它能被复用的原因：`dsh-base` 这份补丁是 `web`、`headless`、`acp`、`sdk` 四个 Profile 共同的第一层，只有 `sdk-minimal` 是例外——它是唯一一个不叠在 `dsh-base` 之上、自己携带完整补丁树的 Bundle。
 
 ### Profile：一个具名的插件树装配
 
-Profile 是"选中哪些 Bundle、以什么顺序叠加、再叠加一份用户自己的补丁"这件事的具名结果。`packages/boot/app-boot/src/profile.ts` 定义了 dsh 自带的两个 Profile 模板：
+Profile 是"选中哪些 Bundle、以什么顺序叠加、再叠加一份用户自己的补丁"这件事的具名结果。`packages/boot/app-boot/src/profile.ts` 定义了 dsh 自带的五个 Profile 模板（早期版本只有 `web`/`headless` 两个，后续跟着 Bundle 一起扩展到了五个）：
 
 ```ts
 // packages/boot/app-boot/src/profile.ts
-/** The shipped profile templates auto-initialized on first use, by name. */
-export const PROFILE_TEMPLATES: Record<string, readonly string[]> = {
-  web: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
-  headless: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'],
+/** Installation-owned defaults used when a shipped profile is first opened. */
+export interface ProfileTemplate {
+  /** Ordered bundle layer list. */
+  bundles: readonly string[]
+}
+
+export const PROFILE_TEMPLATES: Record<string, ProfileTemplate> = {
+  acp: {
+    bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-acp-app'],
+  },
+  web: {
+    bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
+  },
+  headless: {
+    bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'],
+  },
+  sdk: {
+    bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-sdk-app'],
+  },
+  'sdk-minimal': {
+    bundles: ['@deepseek-ai/dsh-sdk-minimal'],
+  },
 }
 ```
 
-`web` Profile 就是"`dsh-base` 加 `dsh-web-app` 这两个 Bundle 按顺序叠起来"，`headless` Profile 是"`dsh-base` 加 `dsh-headless`"——共享的核心能力只维护在 `dsh-base` 一份补丁里，两种部署形态只在各自的 Bundle 里追加自己特有的几行。
+（相比早期版本，模板的值从一个裸的字符串数组包了一层 `ProfileTemplate` 接口——目前这个接口只有 `bundles` 一个字段，但这个改动本身就说明了装配层的一个设计倾向：把"一个 Profile 模板是什么"定义成一个可以继续长字段的结构体，而不是直接假设它永远只是一份 Bundle 列表。）`web` Profile 是"`dsh-base` 加 `dsh-web-app`"，`headless` 是"`dsh-base` 加 `dsh-headless`"，`acp` 是"`dsh-base` 加 `dsh-acp-app`"（面向自动化场景的 stdio ACP 协议应用），`sdk` 是"`dsh-base` 加 `dsh-sdk-app`"（面向 JSON-RPC SDK 调用的应用），`sdk-minimal` 比较特殊——它不叠在 `dsh-base` 之上，`bundles` 里只有它自己这一个完整补丁树。共享的核心能力只维护在 `dsh-base` 一份补丁里，除 `sdk-minimal` 外的四种部署形态都只在各自的 Bundle 里追加自己特有的几行。
 
 真正把多层补丁叠成一棵最终插件树的函数是 `composeEntries`，源码就在同一个文件里：
 
@@ -132,10 +153,10 @@ Profile 解决的是"这个进程装配了哪些服务"，是进程启动时一�
 
 > A **preset** is a directory holding one `agent.cordis.yml`; the roster mounts it ONCE per process under a standing scope, and each session that names it joins by having its agent scope key parented to the mount's.
 
-关键的机制差异在这里：Preset 不是靠"补丁覆盖"实现隔离的，而是靠上一篇提到的 `isolate` 域。dsh 自带的 `standard` Preset（`apps/cli/config/agent-presets/standard/agent.cordis.yml`）是一份真实的生产文件，摘录其中"计划模式"这一段最能说明问题：
+关键的机制差异在这里：Preset 不是靠"补丁覆盖"实现隔离的，而是靠上一篇提到的 `isolate` 域。dsh 自带的 `standard` Preset（`packages/preset/agent-presets/presets/standard/agent.cordis.yml`）是一份真实的生产文件，摘录其中"计划模式"这一段最能说明问题：
 
 ```yaml
-# apps/cli/config/agent-presets/standard/agent.cordis.yml（节选）
+# packages/preset/agent-presets/presets/standard/agent.cordis.yml（节选）
 # Plan state is per-agent by nature, so an entry-local realm is not a
 # workaround here — it is the correct lifetime.
 - id: planning
@@ -156,7 +177,7 @@ Profile 解决的是"这个进程装配了哪些服务"，是进程启动时一�
 同一份文件的注释里还展示了反面判断——哪些行**不**应该放进 `isolate` 分组：
 
 ```yaml
-# apps/cli/config/agent-presets/standard/agent.cordis.yml（节选）
+# packages/preset/agent-presets/presets/standard/agent.cordis.yml（节选）
 # Only the model-facing controls. The task REGISTRY stays on the host plane:
 # ... The registry is keyed by owning agent anyway, so one host instance
 # serves every session. What a preset chooses is whether its agent can

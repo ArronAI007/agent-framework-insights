@@ -23,7 +23,7 @@ Skill 系统给出的答案是"温和版"的动态——技能的**内容**在�
 核心接口定义在 `packages/skill/skill/src/index.ts`:
 
 ```typescript
-// packages/skill/skill/src/index.ts:247-268(节选)
+// packages/skill/skill/src/index.ts:247-268(节选,当前实际字段)
 /** Provider interface for one source of skills, such as local directories or a remote registry. */
 export interface SkillProvider {
 	/** Unique provider name in the `ctx.skills` registry. */
@@ -33,7 +33,7 @@ export interface SkillProvider {
 }
 ```
 
-`list()` 返回的是轻量候选——`SkillCandidate`/`SkillSummary` 只带 `name`/`description`/`whenToUse?`/`invocation`/`source`/`provider` 这些**元数据**字段,不含正文。`get()` 才会真正加载出带 `content: string`(完整 Markdown 正文)的 `SkillDefinition`。这个"先列候选、再按需取正文"的两段式设计,是整套按需加载机制成立的地基。
+`list()` 返回的是轻量候选——`SkillCandidate`/`SkillSummary` 只带 `name`/`description`/`whenToUse?`/`invocation`/`source`/`provider` 这些**元数据**字段,不含正文。`get()` 才会真正加载出带 `content: string`(完整 Markdown 正文)的 `SkillDefinition`。这个"先列候选、再按需取正文"的两段式设计,是整套按需加载机制成立的地基。`list()` 的返回类型是一个联合类型:大多数 Provider(比如下面的 `skill-badge`/`skill-filesystem`)一次性给出完整数组;需要"发现可能没做完、但已经有一批可用候选"这种场景(比如需要探测远程注册表的 Provider)则返回 `SkillProviderObservation`(`{ candidates, complete: boolean }`)——`complete: false` 时,调用方知道这批结果还不能被长期缓存。配合这一点,注册表还提供了 `SkillProviderControl.invalidate()` 给 Provider 自己主动"戳一下"、让已完成的目录缓存失效,不用干等下一次自然过期。
 
 `SkillRegistry` 服务(`packages/skill/skill/src/index.ts`)在这之上再叠一层——它是一个"分层注册表",host 级的 Provider 加上每个 Agent Preset 自己的层,同名冲突时按固定优先级(`RUNTIME_RANK=250`、`BUNDLED_SKILL_RANK=600` 等,数值越小越优先)由最近的层胜出。`get()` 方法的实现特别值得注意——它**不缓存正文**,只缓存轻量候选映射:
 
@@ -75,7 +75,9 @@ const provider: SkillProvider = {
 | 用户级 `~/.dsh/skills` | 400 |
 | 用户级 `~/.agents/skills` | 500 |
 
-对照前面提到的 `RUNTIME_RANK=250`(运行时动态注册的技能)和 `BUNDLED_SKILL_RANK=600`(随包自带的内置技能,如 `skill-badge`),可以看出整条优先级链条的设计意图:**项目级配置 > 运行时注册 > 用户级配置 > 内置默认**——一个项目自己放在 `.dsh/skills` 目录下的同名技能,永远能覆盖用户全局配置甚至内置技能,方便团队用项目内配置统一约束技能行为,而不用担心被某个用户的本地全局配置覆盖。
+除了 `skill-badge` 这个极简示例,当前仓库里还有一个分量重得多的内置 Provider——`packages/skill/skill-office`(`@deepseek-ai/dsh-skill-office`),打包了 `office-docx`/`office-pptx`/`office-xlsx` 三个技能,分别覆盖 Word/PowerPoint/Excel 的文档写作工作流和结构校验,技能正文和资源(带 YAML frontmatter 的 Markdown + 脚本)随包一起分发,同样注册在 `BUNDLED_SKILL_RANK` 这一档优先级上。这算是课程写作时还没有的一个新板块,方向上属于"给内置技能库补充更贴近真实办公场景的技能包",机制上完全复用了本节前面讲的 Provider 接口,不需要新的加载逻辑。
+
+对照前面提到的 `RUNTIME_RANK=250`(运行时动态注册的技能)和 `BUNDLED_SKILL_RANK=600`(随包自带的内置技能,如 `skill-badge`/`skill-office`),可以看出整条优先级链条的设计意图:**项目级配置 > 运行时注册 > 用户级配置 > 内置默认**——一个项目自己放在 `.dsh/skills` 目录下的同名技能,永远能覆盖用户全局配置甚至内置技能,方便团队用项目内配置统一约束技能行为,而不用担心被某个用户的本地全局配置覆盖。
 
 顺带一提两个容易被忽略的边界:技能可以在其元数据里标注 `disable-model-invocation: true`,这样它会从模型可见的目录里消失,但仍然可以被用户用 `/名字` 手势直接触发——也就是"人可以用,模型看不到、也调不了"这档中间状态;另外,整个 Skill 系统里**没有任何"版本号"字段**,同名冲突完全靠层级优先级和注册顺序决定谁生效,不存在语义化版本比对的机制。
 
@@ -196,7 +198,7 @@ const NODE_API_REDIRECTS: Record<string, string> = {
 
 > "The restricted execution environment prevents accidental misuse; it is not a security boundary for malicious code. Services obtained by dynamic code connect to the real runtime."
 
-真正能拿到的能力边界,由插件自己声明的 `inject` 列表决定,而不是由沙箱去裁剪——一个插件完全可以声明依赖 `fs`/`bash`/`subprocess`/`pty`/`web` 这类具备真实主机权限的服务,一旦声明了依赖,拿到的就是真实的服务对象,不是阉割版。此外,动态定义的插件只存在于一个进程内内存态的 `Map` 里,没有任何持久化——进程重启,所有动态对象全部消失,这既是一种"爆炸半径受限"的天然保护,也意味着不能指望这套机制去做长期状态管理。
+真正能拿到的能力边界,由插件自己声明的 `inject` 列表决定,而不是由沙箱去裁剪——一个插件完全可以声明依赖 `fs`/`bash`/`subprocess`/`pty`/`web` 这类具备真实主机权限的服务,一旦声明了依赖,拿到的就是真实的服务对象,不是阉割版。此外,课程写作时动态定义的插件只存在于一个进程内内存态的 `Map` 里,没有任何持久化——进程重启,所有动态对象全部消失。**这一点在当前版本可能已经不完全成立**(见下文关于 Plugin Manager 的说明),读者不应再把"重启即消失"当成默认可依赖的安全假设。
 
 ### `cordis-client-runner` 与 `ui-cordis`:浏览器侧的另一半,更弱的隔离
 
@@ -208,22 +210,21 @@ const NODE_API_REDIRECTS: Record<string, string> = {
 
 ### 默认不启用:`cordis` 预设与 `standard` 预设的分野
 
-这套自举能力不是随手可用的默认工具集,而是被隔离在一个专门的、非默认的 Agent Preset 里。`apps/cli/config/agent-presets/cordis/agent.cordis.yml` 的文件头部注释直接把风险模型写在了配置文件里:
+这套自举能力不是随手可用的默认工具集,而是被隔离在一个专门的、非默认的 Agent Preset 里。**这份配置文件的路径已经变了**:课程写作时在 `apps/cli/config/agent-presets/cordis/agent.cordis.yml`,当前已经挪到了一个独立的 `packages/preset/agent-presets/presets/cordis/agent.cordis.yml`(连带 `minimal`/`standard` 也在同一个包下,并且多出了一个 `ptc` 预设,呼应上一篇提到的沙箱化 PTC 执行引擎)。当前文件头部的风险说明措辞也变了,而且透出一个课程写作时还没有的能力——插件不再只是"进程内内存态、重启即消失",而是多了一条**持久化到 Profile 级别**的路径:
 
 ```yaml
-# The `cordis` agent preset: the standard coding agent, plus the ability to
-# read and write the runtime it is running in.
+# TRUST: Plugin Manager installs persistent, profile-wide code that runs in the Host
+# process outside the workspace sandbox. Every call needs Full access or single-call
+# approval; granting a call does not change the session permission mode.
+# The `cordis` agent preset adds runtime inspection and persistent plugin management.
 #
 # It exists so a person can ask an agent to author another agent. Everything in
-# `standard` is here unchanged; what is added is the self-referential Cordis
-# toolset, a skill that teaches composition authoring, and a persona that says
-# which of the two planes an edit belongs to.
-#
-# TRUST: `cordis_mount` evaluates model-written JavaScript against the live
-# runtime, and a composition this agent writes becomes a preset other sessions
-# mount. Treat a session on this preset as shell access — the toolset's own
-# documentation makes the same statement.
+# `standard` is here unchanged; Creator adds persistent plugin management,
+# runtime inspection, composition-authoring skills, and a persona that explains
+# where profile and preset changes belong.
 ```
+
+> **一个未完全展开、但值得读者留意的信号**:注释里的"Plugin Manager"和"persistent, profile-wide code"这两个说法,和本节前面讲的"动态插件只活在进程内存的 `Map` 里、进程重启即消失"这个结论似乎不完全一致——这暗示当前版本可能新增了一条让已定义插件persist 到 Profile(而不只是单次会话进程)层面的路径。受限于本次核对的时间,没能把这条路径的完整实现细节读透,`cordis_define`/`cordis_run` 等七个工具的核心名字经核实仍然存在于当前源码里(`cordis_define`/`cordis_inspect_list`/`cordis_inspect_query` 均已在源码里逐一确认),但"进程重启后插件全部消失"这句话现在可能不再是全貌——如果你在实际部署里依赖这套机制的"易失性"作为一种安全假设,建议直接去读当前的 `packages/extensions/cordis-host-runner` 和相关 Plugin Manager 实现,不要只依赖本篇的旧结论。
 
 而系统级的默认预设 id 被硬编码为 `standard`(`packages/bundle/web-app/cordis.patch.yml` 里的 `default: standard`),`standard` 预设本身根本不引用 `tool-cordis`/`cordis-host-runner` 这些包——也就是说,一个普通会话从"标准编码 Agent"切换到"能自己写插件改造运行时的 Agent",必须由部署方或使用者显式切换到 `cordis` 这个预设,不存在任何默认路径会不知不觉打开这扇门。这与 Skill 系统里 `skill-badge` 默认关闭是同一种谨慎——但风险等级完全不是一个量级:`skill-badge` 关闭只是少一个生成徽章的技能,而 `cordis` 预设关闭意味着"默认情况下没有任何会话具备重写自己所在运行时的能力"。
 

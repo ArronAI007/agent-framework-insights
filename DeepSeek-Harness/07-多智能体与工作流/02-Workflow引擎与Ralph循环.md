@@ -1,14 +1,14 @@
 # Workflow 引擎与 Ralph 循环
 
-> 一次委派解决"分一个任务出去",但如果任务需要"先跑三个子代理探路,再挑一个结果继续深入,期间还要动态决定要不要多开几路"呢?靠模型在对话里手动一次次调用委派工具来编排,既费 token 又容易在多轮之间丢状态。dsh 的解法是让模型直接写一段 JavaScript 编排脚本,交给一个专门的 `ctx.workflowEngine` 去跑——脚本本身持有循环、分支、并发逻辑,只在需要真正干活时才调用 `agent()` 桥接回宿主进程里的真实子代理。本篇拆开这套 worker_threads + vm 的双层隔离引擎,顺带讲清楚它与"每轮启动全新子代理"的 Ralph 循环之间的关系。
+> 一次委派解决"分一个任务出去",但如果任务需要"先跑三个子代理探路,再挑一个结果继续深入,期间还要动态决定要不要多开几路"呢?靠模型在对话里手动一次次调用委派工具来编排,既费 token 又容易在多轮之间丢状态。dsh 的解法是让模型直接写一段 JavaScript 编排脚本,交给一个专门的 `ctx.workflowEngine` 去跑——脚本本身持有循环、分支、并发逻辑,只在需要真正干活时才调用 `agent()` 桥接回宿主进程里的真实子代理。**这一篇的执行层描述已根据最新源码更新**:课程写作时,唯一的引擎实现是自建的 worker_threads + `node:vm` 双层隔离;当前版本已经把执行层整体迁移到一个新的、被多个子系统共享的沙箱化子进程执行引擎 `ctx.ptcRuntime`(PTC Runtime)之上——这不再只是"遏制"(containment),而是真正接上了 `ctx.sandbox`/`ctx.subprocess` 这套 OS 级沙箱与进程治理体系。本篇按当前实现重新讲清楚这套隔离机制的分层,以及它与"每轮启动全新子代理"的 Ralph 循环之间的关系。
 
 ## 学习目标
 
-- 理解 `ctx.workflowEngine` 作为一个 Cordis 服务抽象只暴露一个 `start()` 方法,以及具体实现 `workflow-worker-thread` 如何通过声明式组合(`cordis.yml`)绑定到这个服务位。
-- 掌握 worker-thread + `node:vm` 的双层隔离结构:worker 线程解决"host 事件循环不被脚本同步代码阻塞、能被强制终止",vm 上下文解决"脚本运行在一个干净的全局对象里",并理解为什么源码反复强调"这不是安全边界"。
-- 弄清脚本里的 `agent()` 调用如何跨越 worker/host 边界,真正触达宿主进程里的 `ctx.subagents`——这条消息协议(`ChildStart`/`ChildStarted`/`ChildSettled`)是整套桥接机制的关键。
-- 把这套隔离机制与 Code Mode(第五篇提到的模型编程式调用工具的沙箱)做对比,弄清楚两者是不是同一套东西,还是"用了同一个 Node 原语,各自实现"。
-- 理解 `tool-ralph`"每轮启动全新子代理"的设计动机——用共享工作区 + 一份小的结构化交接报告,在杜绝上下文污染的同时仍然让进度可以累积。
+- 理解 `ctx.workflowEngine` 作为一个 Cordis 服务抽象只暴露一个 `start()` 方法(这一点自课程写作以来没有变化),以及具体实现 `workflow-ptc` 如何通过声明式组合(`cordis.yml`)绑定到这个服务位。
+- 掌握当前的执行隔离结构:脚本运行在一个全新的、由 `ctx.ptcRuntime` 启动的**独立 Node 进程**里,进程通过与 `bash` 工具共享的同一个 `ctx.sandbox` Provider 应用 OS 级沙箱策略,生命周期交给 `ctx.subprocess` 统一治理;进程内部仍然用 `node:vm` 做一层价值物化(materialize)上的保护,但真正的安全边界已经上移到"进程 + OS 沙箱"这一层,不再是"仅遏制、非安全边界"。
+- 弄清脚本里的 `agent()` 调用如何跨越进程边界,真正触达宿主进程里的 `ctx.subagents`——这条通信走的是一条独立于程序 stdout/stderr 的专用二进制控制通道,协议角色和课程写作时的 worker `postMessage` 版本类似,但载体已经从"同进程 worker 的 MessagePort"变成了"跨进程的受管道"。
+- 理解这套沙箱化 PTC 执行引擎为什么会被 workflow 和其他多个子系统(工具执行、fs、ssh 等)共享——这是一次明确的架构收敛:课程写作时"各自独立实现、不共享代码"的 Code Mode 沙箱(`code-runtime` 包)已经不存在了,它的职责被合并进了同一个 `ptc-runtime` seam。
+- 理解 `tool-ralph`"每轮启动全新子代理"的设计动机——用共享工作区 + 一份小的结构化交接报告,在杜绝上下文污染的同时仍然让进度可以累积(这部分工具层逻辑基本没有变化)。
 
 ## 背景与设计动机
 
@@ -62,22 +62,19 @@ export interface WorkflowRun {
 
 `result` 这个 Promise **永远不会 reject**——任何失败都会 resolve 成一个带 `stopReason: 'cancelled' | 'error'` 的 `WorkflowResult`,这与第一篇讲工具异常处理时"永远把异常转成正常结果反馈给模型"的原则一脉相承。运行时的生命周期通过六个 Cordis 事件(`workflow/start`/`/phase`/`/log`/`/agent-start`/`/agent-end`/`/end`)对外广播,这些事件只携带数据快照,从不把活的 `WorkflowRun` 对象泄露出去——观察者永远只能看,不能拿着事件里的对象反向操控运行。
 
-`ctx.workflowEngine` 的绑定不是硬编码在某个中心化的注册表里,而是普通的 Cordis 插件声明式组合。具体实现包 `workflow-worker-thread` 通过继承来"认领"这个服务位:
+`ctx.workflowEngine` 的绑定不是硬编码在某个中心化的注册表里,而是普通的 Cordis 插件声明式组合。**当前**实现包是 `workflow-ptc`(课程写作时的实现包叫 `workflow-worker-thread`,已被取代),通过继承来"认领"这个服务位,机制不变,只是底层执行方式换了:
 
 ```typescript
-// packages/workflow/workflow-worker-thread/src/index.ts:112(节选)
-class WorkerThreadWorkflowEngine extends WorkflowEngine {
-	static inject = ['subagents']
-	// ...
-}
-export default WorkerThreadWorkflowEngine
+// packages/workflow/workflow-ptc/src/index.ts(节选,当前实现)
+// class 通过 extends WorkflowEngine 认领 ctx.workflowEngine 服务位,
+// 构造函数里调用 super(ctx, 'workflowEngine')
 ```
 
-因为它 `extends WorkflowEngine`(其构造函数调用了 `super(ctx, 'workflowEngine')`),只要这个插件被加载进 Cordis 上下文,`ctx.workflowEngine` 就自动指向了它。真正的装配点是一份声明式的组合文件,例如 `examples/acp-agent/cordis.yml`:
+因为它 `extends WorkflowEngine`(其构造函数调用了 `super(ctx, 'workflowEngine')`),只要这个插件被加载进 Cordis 上下文,`ctx.workflowEngine` 就自动指向了它。真正的装配点是一份声明式的组合文件,例如:
 
 ```yaml
-- id: workflow-worker-thread
-  name: '@deepseek-ai/dsh-workflow-worker-thread'
+- id: workflow-ptc
+  name: '@deepseek-ai/dsh-workflow-ptc'
   config:
     provider: spawn
 
@@ -88,111 +85,40 @@ export default WorkerThreadWorkflowEngine
   name: '@deepseek-ai/dsh-tool-ralph'
 ```
 
-`docs/subsystems/workflow.md` 把这个设计规则说得很直接:一个 Cordis 上下文里只允许**一个**引擎实现提供 `ctx.workflowEngine`,没有按名字区分的多引擎注册表——换一个引擎实现,是在组合配置里替换掉这一行,而不是让两个引擎并存。
+`docs/subsystems/workflow.md` 把这个设计规则说得很直接:一个 Cordis 上下文里只允许**一个**引擎实现提供 `ctx.workflowEngine`,没有按名字区分的多引擎注册表——换一个引擎实现,是在组合配置里替换掉这一行,而不是让两个引擎并存。历史上这一行确实被替换过一次:`workflow-worker-thread` → `workflow-ptc`,正是下面要讲的那次架构收敛。
 
-### `workflow-worker-thread`:两层隔离——`worker_threads` + `node:vm`
+### `workflow-ptc`:从"worker+vm 遏制"升级为"沙箱化子进程执行"
 
-这是目前唯一的引擎实现,也是本篇的重点。它用了两层隔离机制,分工不同:
+这是当前唯一的引擎实现,机制相对课程写作时有实质性变化。仓库里一份 2026-09-11 的架构决策记录(`.agents/notes/implemented/architecture/2026-09-11-sandboxed-node-ptc-runtime.zh.md`)把动机写得很直接——原先的 worker 方案有一个结构性缺陷:
 
-1. **`node:worker_threads.Worker`**——每次工作流运行都在一个全新、不复用的 worker 线程里跑。这一层解决的是"host 主线程不被脚本的同步代码阻塞"以及"能被硬终止(`worker.terminate()`)"。
-2. **`node:vm`**——在 worker 线程*内部*,脚本正文运行在一个独立的 `vm.Context` 里(通过 `vm.createContext` 建立一个真正不同的全局对象),用 `vm.Script.runInContext()` 执行。
+> "Node worker 隔离 JavaScript 状态,但不应用调用 Session 的 OS 沙箱策略。模型代码可以直接导入文件系统与子进程 API,绕过工具策略路径,即使嵌套 `tools.*` 调用受到正确检查。终止 worker 也不能证明其子进程已停止。"
 
-这两层隔离合起来是**"遏制"(containment),而不是"安全边界"**——源码模块文档说得非常直白:
+也就是说,课程写作时那套"worker_threads 隔离主线程 + vm 隔离全局对象,但明确声明'这不是安全边界'"的设计,恰恰卡在了这个问题上:vm 能挡住模型代码直接碰到 host 进程里的敏感对象引用,但挡不住脚本里一句 `require('fs')` 或 `require('child_process')` 直接绕过所有工具层的策略检查。当前的解法是把整套执行下沉到一个共享的服务位 `ctx.ptcRuntime`(PTC Runtime,详见 `docs/subsystems/ptc-runtime.md`),它的隔离结构变成了两层,分工也变了:
 
-> "The worker-thread engine ... bridges `agent()` calls to host subagents. The thread prevents synchronous script work from blocking the host and permits forced termination, but it is containment rather than a security boundary."
+1. **一个全新的 Node 子进程**(不是 worker 线程)——每次运行由 `dsh-ptc-runtime-node` 在一个全新进程里跑脚本,进程通过与 `bash` 工具**同一个** `ctx.sandbox` Provider 解析并应用调用会话的 OS 沙箱策略(文件系统读写限制等),进程本身的生命周期(启动、超时终止、清理)交给 dsh 统一的 `ctx.subprocess` 服务治理,而不是引擎自己管。这一层才是真正的安全边界来源。
+2. **进程内部仍然用 `node:vm`**——但用途变了,不再是"隔离全局对象防止脚本碰到 host 引用",而是用于安全地"物化"(materialize)脚本抛出的值/getter 返回值,防止读取一个恶意构造的 `.stack`/`.message` 属性时触发意外的副作用代码。源码注释写得很明确:"Getters and proxy traps may execute inside the confined Node process; process isolation and cancellation belong to PTC, not the VM"(getter 和 proxy 陷阱可能在受限的 Node 进程内部执行;进程隔离和取消属于 PTC,不属于 vm)。
 
-`runtime.ts` 的文档进一步强调:"vm 不是安全边界。worker 提供的是主线程隔离和强制终止,不是对恶意值的遏制。" 换句话说,这套机制的信任前提与 `bash` 工具是等价的——脚本对模型来说和 shell 访问权限是同一个信任等级,只是多了"跑坏了能干净地杀掉"这一层工程上的便利,而不是多了一层安全沙箱。
+也就是说,"这不是安全边界"这句话不再适用于当前的执行层——当前架构里,进程边界 + `ctx.sandbox` 强制策略才是安全边界的来源,vm 只是进程内部的一个价值安全网。不过设计记录也留了一句谨慎的免责声明,值得记住:"程序成功不证明完整强制能力"(`process` 描述符与额外控制通道也不声明多租户隔离)——沙箱策略是否被完整强制执行,和程序本身有没有报错是两件独立的事,不能因为脚本正常跑完就假设沙箱一定生效了。
 
-vm 上下文里到底能用什么?`packages/workflow/workflow-worker-thread/src/runtime.ts` 给出了确切答案——**只注入五个全局量,没有别的**:
+脚本里能调用的全局函数在当前实现里还是那五个(`agent`/`parallel`/`pipeline`/`phase`/`log`),这一点没有变化,只是它们现在是通过 PTC 的绑定(binding)机制注入,而不是直接挂在 `vm.createContext()` 的全局对象上。
 
-```typescript
-// packages/workflow/workflow-worker-thread/src/runtime.ts:98-113
-this.context = vm.createContext({}, { name: `workflow:${meta.name}` })
+### 进程与 Host 之间怎么"越境":`agent()` 如何桥接回真正的子代理
 
-const globals: Record<string, unknown> = {
-	agent: (prompt: unknown, opts?: unknown) => this.contain(this.agent(prompt, opts)),
-	parallel: (thunks: unknown) => this.contain(this.parallel(thunks)),
-	pipeline: (items: unknown, ...stages: unknown[]) => this.contain(this.pipeline(items, stages)),
-	phase: (title: unknown) => { this.phase(title) },
-	log: (message: unknown) => { this.log(message) },
-	// workerData already performed the real cross-thread structured clone.
-	args,
-}
-for (const [key, value] of Object.entries(globals)) {
-	;(this.context as Record<string, unknown>)[key] = typeof value === 'function' ? Object.freeze(value) : value
-}
-```
+这是整套机制里最值得细看的一环——脚本运行在一个独立的沙箱化子进程里,但它调用 `agent()` 想要启动的是**宿主进程里真实的子代理**(`ctx.subagents`)。这中间必须跨越一次进程边界。课程写作时这条边界是 worker 的 `MessagePort`,当前实现换成了 PTC 运行时提供的"专用二进制控制通道"——`.agents/notes/implemented/architecture/2026-09-11-sandboxed-node-ptc-runtime.zh.md` 里的描述是:"子进程所有者提供专用的继承式二进制控制通道,与程序 stdout/stderr 及 launcher 生命周期 IPC 分开。Host 限制帧、排队写入、待处理调用和未完成参数字节,然后在分派前验证调用身份与绑定允许列表。" 通道的角色分工和课程写作时的协议(区分"guest → host 的请求"与"host → guest 的回复/结算通知")在思路上是一致的,只是载体从"同进程 worker 的 MessagePort"变成了"跨进程的受管道",且明确写着"模型代码可以写入该通道,因此其中字节仍不可信"——host 侧不能假设从这条通道读到的字节是安全的,必须像对待任何外部输入一样校验。
 
-没有 `require`、没有 `fs`、没有 `fetch`、没有定时器——脚本里唯一能做的"动作"就是调用这五个函数。README 里的说法更直接:"没有故意注入任何定时器、文件系统 API 或 Node 全局量,但上面提到的信任前提依然成立"——也就是说,即便这五个全局量看起来很干净,一段刻意构造的脚本理论上仍然可能从 worker 线程本身的进程权限里找到逃逸路径,这不是这套 vm 设计要去堵的洞。
+`agent()` 桥接到子代理运行时的最终落点没有变——还是调用 `ctx.subagents.start(provider, { prompt, parent, signal, ... })`。**关键点也没有变**:`ctx.subagents` 只在 host 侧被触及,子进程本身没有、也永远不会拿到对它的直接引用,它手里只有一个通过受管道往返的 RPC 桩。跨这条边界传递的值仍然必须是纯 JSON——函数、Symbol、循环引用、非有限数字等都会被拒绝,这一校验现在发生在 `realm.ts` 的 `materializeFromRealm` 里(和课程写作时的文件名一致,逻辑角色也一致)。
 
-### Worker 与 Host 之间怎么"越境":`agent()` 如何桥接回真正的子代理
+并发和取消也是这套机制要管的事,配置项基本延续了下来:`maxConcurrentAgents`(默认按 CPU 核数自动推算,当前代码里是 `min(16, max(1, cores - 2))`)、`maxTotalAgents`(默认 1000,作为"失控循环"的兜底)、`maxItemsPerCall`(`parallel`/`pipeline` 单次调用的元素上限,默认 4096)、`syncTimeoutMs`(脚本"起始同步切片"的 vm 超时,默认 5000ms)。取消时,host 通过受管子进程发出取消信号,进程侧脚本会在下一次 `await` 处停下;如果不配合,PTC 运行时会强制结束这个受管子进程。
 
-这是整套机制里最值得细看的一环——脚本运行在 worker 线程里,但它调用 `agent()` 想要启动的是**宿主进程里真实的子代理**(`ctx.subagents`)。这中间必须跨越一次线程边界,靠的是一套消息协议,定义在 `packages/workflow/workflow-worker-thread/src/protocol.ts` 里,方向分得很清楚:
+### 与"Code Mode"的关系:从"各自实现"到"共享同一个执行引擎"
 
-```typescript
-// packages/workflow/workflow-worker-thread/src/protocol.ts:14-31(节选)
-export enum WorkerToHostType {
-	Ready = 'ready',
-	Phase = 'phase',
-	Log = 'log',
-	AgentStart = 'agent-start',
-	AgentEnd = 'agent-end',
-	ChildStart = 'child-start',     // 向 host 请求:启动一个真正的子代理
-	ChildDispose = 'child-dispose',
-	Result = 'result',
-}
-```
+课程写作时,dsh 里还有另一套基于 worker 线程的沙箱——`packages/code-runtime`,用于"Code Mode"(模型编写 JS 代码去程序化调用工具,而不是一次一个工具调用),和 workflow 引擎"共用同一个 Node 原语,但彼此独立实现,没有共享的沙箱/vm 工具库"。
 
-```typescript
-// packages/workflow/workflow-worker-thread/src/protocol.ts:54-69(节选)
-export enum HostToWorkerType {
-	Go = 'go',
-	Cancel = 'cancel',
-	ChildStarted = 'child-started',       // host 侧真的启动成功了
-	ChildStartError = 'child-start-error',
-	ChildSettled = 'child-settled',       // 子代理跑完了,结果是什么
-	ChildFailed = 'child-failed',
-	ChildDisposed = 'child-disposed',
-}
-```
+**这个结论在当前版本已经不成立了。** `packages/code-runtime` 这个包在当前仓库里已经不存在——同样是为了解决"worker 隔离挡不住模型代码直接绕过工具策略"这个结构性问题,Code Mode 的执行也被合并进了同一个 `ctx.ptcRuntime` seam(仓库里能看到一份专门的后续设计记录 `2026-09-13-workflow-ptc-sandbox-reuse`,明确讨论了 workflow 复用这套沙箱执行能力的决策)。现在 `packages/ptc-runtime/` 是一个被相当多子系统共享的通用执行原语——不只是 workflow 和"运行代码"这类模型可见的能力,`packages/core/tools`、`packages/fs/tool-fs`、`packages/ssh/ssh`、`packages/mcp/mcp-resources` 等好几个子系统的 package.json 里都能看到对 `@deepseek-ai/dsh-ptc-runtime` 的依赖。
 
-worker 侧的 `agent()` 钩子把请求包装成一次 RPC(通过真实的 `MessagePort` 发出 `ChildStart`,带一个 `callId` 用于关联请求和回复),然后等待 host 的回复。host 侧收到之后,才真正去调用 dsh 的子代理运行时:
+也就是说,dsh 在这段时间里做了一次很典型的"发现两个子系统在解决同一类问题、于是把执行层收敛成一个共享 seam"的重构:workflow 编排脚本和"模型编程式调用工具"曾经是两套独立的 worker+vm 沙箱,现在统一构建在同一个"沙箱化子进程执行引擎"之上,新增能力(比如更完整的 OS 沙箱策略强制、进程级资源限制)只需要在 `ptc-runtime` 这一层做一次,所有消费方都能受益,而不用像以前那样在每个独立实现里各自补一遍。
 
-```typescript
-// packages/workflow/workflow-worker-thread/src/host.ts(节选)
-run = await this.subagents.start(this.provider, {
-	prompt: [{ type: 'text', text: request.prompt }],
-	parent: this.parent,
-	signal: this.controller.signal,
-	// ...
-})
-```
-
-**关键点**:`ctx.subagents` 只在 host 侧被触及——worker 线程本身没有、也永远不会拿到对它的直接引用,它手里只有一个 RPC 桩(通过 `postMessage` 往返)。这意味着即便脚本执行环境出了岔子,它能造成的破坏也局限在"它能发出什么样的 `ChildStart` 请求",而不是直接拿到一个活的子代理服务对象。跨这条边界传递的值必须是纯 JSON——函数、Symbol、循环引用、非有限数字等都会被拒绝,这一校验发生在 `realm.ts` 的 `materializeFromRealm` 里。
-
-并发和取消也是这套机制要管的事:`maxConcurrentAgents`(默认按 CPU 核数自动推算)、`maxTotalAgents`(默认 1000,作为"失控循环"的兜底)、`maxItemsPerCall`(`parallel`/`pipeline` 单次调用的元素上限,默认 4096)。取消时,host 发出 `Cancel`,worker 侧脚本会在下一次 `await` 处死掉;如果脚本不配合,一个宽限期(默认 5000ms)之后引擎会强制把这次运行判定为 `cancelled` 并调用 `worker.terminate()`。
-
-### 与 Code Mode 的 worker-thread 隔离对比
-
-dsh 里还有另一套基于 worker 线程的沙箱——`packages/code-runtime`,用于"Code Mode"(模型编写 JS 代码去程序化调用工具,而不是一次一个工具调用)。这两套机制**共用同一个 Node 原语(`worker_threads.Worker`),但彼此独立实现,没有共享的沙箱/vm 工具库**。
-
-最直观的区别体现在脚本的执行现实(execution realm)上——`workflow-worker-thread` 用 `node:vm` 建了一个真正独立的全局对象;而 `code-runtime` 的 worker 线程实现里完全没有出现 `node:vm`,它用 Node 原生的 `stripTypeScriptTypes` 剥掉 TS 类型标注,再用 `AsyncFunction` 构造器**直接在 worker 自身的全局现实里**运行代码:
-
-```typescript
-// packages/code-runtime/code-runtime-worker-thread/src/bootstrap.ts(节选)
-const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...fnArgs: unknown[]) => Promise<unknown>
-const fn = new AsyncFunction(
-	...data.namespaces.map(namespace => namespace.global),
-	...errorClassParameters,
-	'console',
-	`'use strict';\n${data.code}`,
-)
-const value = await fn(...namespaces, ...errorClassValues, consoleShim)
-```
-
-两者选择 worker 线程的理由是一样的——把可能长时间运行的同步 CPU 工作挪出主线程,并保留"能被硬终止"的能力,而且都在文档里明确写着"这是遏制,不是安全边界"。但预算模型不同:Code Mode 会真的度量 CPU 时间(通过 `worker.performance.eventLoopUtilization()` 轮询)、有墙钟时限和堆内存上限;而 workflow 引擎只有一个针对脚本"起始同步切片"的 vm 超时,加上并发数/子代理总数/单次调用元素数这几个业务层面的帽子,没有 CPU 时间或堆内存度量。桥接的形状也不同:Code Mode 暴露的是一组任意"绑定命名空间"(工具调用代理对象);workflow 只暴露固定的五个钩子函数。
-
-结论是:**同一个 Node 原语,因为同一个理由被选中,但两套隔离层各自独立工程化,互不复用代码**。
+结论从"同一个 Node 原语,因为同一个理由被选中,但两套隔离层各自独立工程化,互不复用代码"更新为:**同一个安全缺陷(worker 挡不住绕过工具策略的直接系统调用)被发现后,两套原本独立的执行层被合并成了一个共享的、真正接入 OS 沙箱的执行引擎**。
 
 ### `tool-workflow`:模型编写 JS 编排脚本的入口
 
@@ -272,13 +198,13 @@ function requireFreshProvider(ctx: Context, name: string): SubagentProvider {
 
 ## 常见问题/易踩坑
 
-- **别把 vm/worker 隔离误当成安全沙箱。** 源码在至少四个不同位置(`workflow-worker-thread` 的模块文档、`runtime.ts`、`code-runtime-worker-thread` 的 README)反复强调"这是遏制,不是安全边界"。脚本的信任等级等同于 `bash` 工具——如果你的部署场景需要真正隔离不可信代码,这套机制不是答案,文档本身也提到过 `isolated-vm` 之类的方案因为维护状态和部署要求被放弃了,目前没有现成的进程外/隔离堆方案顶在这个服务位后面。
+- **不要用课程写作时"这是遏制,不是安全边界"的旧结论套用到当前版本。** 当前 `workflow-ptc` 已经把执行下沉到一个真正应用 `ctx.sandbox` OS 沙箱策略的独立子进程,安全模型比早期的 worker+vm 方案强得多——但设计记录仍然明确提醒"程序成功不证明完整强制能力",沙箱是否被完整强制执行和脚本有没有报错是两件独立的事。判断一段编排脚本的信任边界,应该去看 `docs/subsystems/ptc-runtime.md` 和当时具体部署的 `ctx.sandbox` 策略,而不是凭历史印象。
 - **`agent()` 调用失败会静默降级成 `null`,而不是抛异常。** 脚本作者(也就是模型)需要用 `.filter(Boolean)` 之类的写法去处理这种"某个子任务失败了但整个脚本还想继续"的情况;而像"启动参数不合法""触发了并发/总数上限"这类致命错误,则会以 `WorkflowError` 的形式直接杀死整个运行——这是刻意的两级错误处理策略,写编排脚本时要分清"哪些失败该忽略、哪些失败该让整个工作流跟着挂掉"。
 - **Ralph 的完成判定没有第三方裁判。** 如果你的场景需要"客观验证任务确实完成了"而不是"子代理自己说完成了",需要在 `objective` 的表述里显式要求子代理提供可核查的证据(`evidence` 字段),或者在工作区外再加一层独立的验收检查,不能假设 Ralph 循环自带质检环节。
 
 ## 小结
 
-`ctx.workflowEngine` 是一个只有 `start()` 一个方法的 Cordis 服务位,具体实现 `workflow-worker-thread` 用"worker 线程隔离主线程 + vm 上下文隔离全局对象"两层机制承载模型编写的 JS 编排脚本,脚本通过五个受限全局函数(核心是 `agent()`)经一套显式的消息协议桥接回宿主进程里真实的 `ctx.subagents`。这套隔离与 Code Mode 的 worker-thread 沙箱共享同一个 Node 原语和"遏制而非安全边界"的定位,但两者是独立实现,预算模型和桥接形状都不同。`tool-ralph` 是这套引擎上长出来的一个高度约束的固定循环:模型只能填目标和轮数,每一轮都是一次全新的、不继承任何对话历史的委派,靠共享工作区和一份小的结构化交接报告让进度在"干净上下文"和"累积进展"之间找到平衡。
+`ctx.workflowEngine` 是一个只有 `start()` 一个方法的 Cordis 服务位,这一层抽象自课程写作以来没有变化。变化最大的是具体实现:早期的 `workflow-worker-thread`(worker 线程隔离主线程 + vm 上下文隔离全局对象,明确"非安全边界")已经被 `workflow-ptc` 取代——脚本现在运行在一个由共享的 `ctx.ptcRuntime` 服务启动的独立沙箱化子进程里,真正接入了 `ctx.sandbox`/`ctx.subprocess` 这套 OS 级沙箱与进程治理,vm 退居为进程内部的一层价值物化保护。这次迁移同时也让 workflow 引擎和曾经独立实现的 Code Mode 沙箱(`code-runtime`,现已不存在)收敛成了同一个共享执行引擎——根源都是同一个安全缺陷:纯 worker 隔离挡不住脚本直接绕过工具策略去调用系统 API。脚本对外暴露的五个受限全局函数(核心是 `agent()`)和跨进程边界"只传纯 JSON"的约束都延续了下来。`tool-ralph` 是这套引擎上长出来的一个高度约束的固定循环:模型只能填目标和轮数,每一轮都是一次全新的、不继承任何对话历史的委派,靠共享工作区和一份小的结构化交接报告让进度在"干净上下文"和"累积进展"之间找到平衡——这部分工具层逻辑基本没有变化。
 
 思考题:
 
