@@ -259,59 +259,50 @@ export function apply(ctx: Context): void {
 
 值得留意的是,这套策略并没有让"每一步都要等一次磁盘 I/O",因为它调用的是同一个 `flush()`,而这个 flush 具体做了什么、代价有多大,取决于下一节的写批量策略——**语义上的"必须落盘"和实现上的"批量写入优化"是两个独立的层次**。
 
-### SessionWriteBehind：批量写入而不是逐事件同步落盘
+### 批量写入而不是逐事件同步落盘
 
-`ctx.sessions.flush()` 最终落到 `PersistenceCoordinator`（`packages/session/session-persistence/src/coordinator.ts`)持有的每会话 `SessionWriteBehind` 实例上。日常追加事件走的是"攒一批再写"的路径:
+> **2026-09 更新**：这一层的包结构和类名相比早期版本变化不小——`packages/session/session-persistence` 现在只保留一份**存储契约**（`storage-contract.ts`/`errors.ts`/`revision.ts`：定义 `SessionHandle` 接口、约定错误类型、版本校验，不含具体实现），真正的批量写入逻辑挪到了一个具体的后端实现包 `packages/session/session-persistence-jsonl` 里，直接作为实现 `SessionHandle` 的类（`JsonlSessionHandle`，`storage.ts`）上的方法，早期版本里独立的 `PersistenceCoordinator`/`SessionWriteBehind` 这两个类已经不存在了。这是"接口与实现分离"的一次重构，为将来接入非 JSONL 的持久化后端留出了空间，但批量写入的核心机制（缓冲 + 定时器窗口 + 显式 flush 提前结清）完全没变。
+
+`ctx.sessions.flush()` 最终落到 `JsonlSessionHandle`（`packages/session/session-persistence-jsonl/src/storage.ts`）实例的 `enqueueLive()`/`drainLive()` 方法上。日常追加事件走的是"攒一批再写"的路径:
+
+```typescript
+// packages/session/session-persistence-jsonl/src/storage.ts（节选）
+enqueueLive(event: SessionEvent, reportBackgroundFailure: (error: unknown) => void): void {
+  this.buffered.push(structuredClone(event))
+  if (this.batchTimer !== undefined || this.drainPaused) return
+  this.batchTimer = setTimeout(() => {
+    this.batchTimer = undefined
+    this.drainLive().catch(reportBackgroundFailure)
+  }, LIVE_WRITE_BATCH_MAX_DELAY_MS)
+}
+
+drainLive(): Promise<void> {
+  return this.draining ??= this.drainBuffered().finally(() => { this.draining = undefined })
+}
+```
+
+```typescript
+// packages/session/session-persistence-jsonl/src/storage.ts
+export const LIVE_WRITE_BATCH_MAX_DELAY_MS = 200
+```
+
+默认的批量窗口依然是 200 毫秒（常量改了名字，数值没变）——`enqueueLive()` 只在没有定时器在跑、且没有被暂停（`drainPaused`）时才会启动一个新的定时器,窗口内到达的所有事件会被合并成一次真正的持久化写入（`drainLive()` 用 `this.draining ??= ...` 这个惯用法保证并发调用只会真正触发一次排空，其余调用者共享同一个 promise）。`flush()` 则是明确要求"现在立刻结清,不要等定时器":
 
 ```typescript
 // packages/session/session-persistence/src/write-behind.ts
-enqueue(event: SessionEvent): void {
-  const wasEmpty = this.pending.length === 0
-  this.pending.push(structuredClone(event))
-  if (this.barrier !== undefined) return
-  if (this.automaticPaused) { this.automaticPaused = false; this.deadlineExpired = false; this.armTimer() }
-  else if (wasEmpty) { this.armTimer() }
-}
-
-private armTimer(): void {
-  this.timer = setTimeout(() => { this.onDeadline() }, this.options.maxDelayMs)
+flush(session: Session): Promise<boolean> {
+  const { carrier } = this.liveEntryFor(session)
+  const callbacks = collectSessionCallbacks(this.ctx, [carrier, 'session/flush', session])
+  const results = await Promise.allSettled(callbacks.map(callback => callback(session)))
+  const failure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+  if (failure !== undefined) throw failure.reason
+  return callbacks.length > 0
 }
 ```
 
-```typescript
-// packages/session/session-persistence/src/coordinator.ts
-export const DEFAULT_WRITE_BATCH_MAX_DELAY_MS = 200
-```
+> **2026-09 更新**：`ctx.sessions.flush(session)`（`packages/core/session/src/index.ts`）现在的实现是向所有注册了 `'session/flush'` 的监听器**并行**派发一次调用、`Promise.allSettled` 等它们全部结束、只要有一个失败就把第一个失败原因抛出去——这是一个"多个持久化后端都可以挂一个 durability 监听器"的 fan-out 设计,取代了早期版本里"直接调用某个具体 `PersistenceCoordinator` 实例的 `flush()`"这种点对点调用。`session-persistence-jsonl` 后端正是通过 `ctx.on('session/flush', session => writer.flush())` 注册自己的监听器,内部再去调用上一节的 `drainLive()` 把缓冲的事件同步排空。
 
-默认的批量窗口是 200 毫秒——`enqueue()` 只在队列从空变非空、或者上一批写入失败恢复后重新排队时才会启动一个新的定时器,窗口内到达的所有事件会被合并成一次真正的持久化写入。`flush()` 则是明确要求"现在立刻结清,不要等定时器":
-
-```typescript
-// packages/session/session-persistence/src/write-behind.ts
-flush(): Promise<void> {
-  if (this.barrier !== undefined) return this.barrier
-  this.cancelTimer()
-  const barrier = Promise.withResolvers<void>()
-  this.barrier = barrier.promise
-  void this.drainBarrier(barrier.resolve, barrier.reject)
-  return barrier.promise
-}
-
-private async drainBarrier(resolve, reject): Promise<void> {
-  try {
-    const overlapping = this.active
-    if (overlapping !== undefined) await Promise.allSettled([overlapping])
-    while (this.pending.length > 0) await this.startWrite(false)
-  } catch (error: unknown) {
-    this.barrier = undefined
-    reject(error)
-    return
-  }
-  this.barrier = undefined
-  resolve()
-}
-```
-
-`flush()` 取消掉还没触发的定时器,等正在进行中的写入完成,然后**同步地、不经过延迟窗口**把剩下所有排队事件写完——这正是 `session-checkpoint-policy` 三处调用所依赖的行为:调用 `flush()` 之后拿到的 `Promise` resolve,意味着此刻为止追加的所有事件都已经真正落盘,才安全地继续往下走。这套设计让"绝大多数普通事件追加"走一条便宜的、批量摊销的路径,只有真正需要durability 保证的那几个关键时刻才付出"立刻写入"的代价——**语义上的可靠性从不打折,但性能代价被精确限制在必须付出的地方**。
+不管挂了几个监听器，语义都没变：调用 `ctx.sessions.flush()` 拿到的 `Promise` resolve,意味着此刻为止追加的所有事件都已经真正落盘（对每一个参与的持久化后端都成立),才安全地继续往下走——这正是 `session-checkpoint-policy` 三处调用所依赖的行为。这套设计让"绝大多数普通事件追加"走一条便宜的、批量摊销的路径,只有真正需要 durability 保证的那几个关键时刻才付出"立刻写入"的代价——**语义上的可靠性从不打折,但性能代价被精确限制在必须付出的地方**。
 
 ## 常见问题/易踩坑
 

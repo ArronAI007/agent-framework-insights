@@ -4,8 +4,8 @@
 
 ## 学习目标
 
-- 理解 `SessionEventMap` 里各类事件（`turn/start`、`user/message`、`assistant/chunk`、`tool/call`、`request/header` 等）分别记录了什么语义，哪些是"日志专用、不产生消息"的记录，哪些会真正进入模型看到的历史。
-- 理解 Surface 概念：`SurfaceEventType` 只包含三种事件（`user/message`/`assistant/message`/`tool/result`），以及 `SurfaceOp` 的 `append` 与 `{ op: 'replace' }` 两种写入方式分别对应什么场景。
+- 理解 `SessionEventMap` 里各类事件（`turn/start`、`user/message`、`assistant/attempt`、`tool/call`、`request/header` 等）分别记录了什么语义，哪些是"日志专用、不产生消息"的记录，哪些会真正进入模型看到的历史。
+- 理解 Surface 概念：`SurfaceEventType` 包含四种事件（`system/message`/`user/message`/`assistant/message`/`tool/result`——早期版本这里只有后三种，`system/message` 是后来加入的），以及 `SurfaceOp` 的 `append` 与 `{ op: 'replace' }` 两种写入方式分别对应什么场景。
 - 通读 `Session.append()` 与 `foldSurface()`/`SurfaceManager` 的真实实现，理解"日志不可变，但可见视图可以折叠重写"这句话在代码层面具体是怎么落地的。
 - 理解 `Session.deriveMessages()` 的增量缓存策略：为什么一次调用的开销是 O(新增节点数) 而不是 O(全部历史)。
 - 通过 `RuntimeContextProjection` 这个具体案例，理解插件如何"只读日志、增量维护自己的投影状态"，而不需要维护一份独立的、可能与日志失配的可变状态。
@@ -49,11 +49,14 @@
 **原始流与调用记录**：
 
 ```typescript
-'assistant/chunk': { turn: number; step: number; chunk: StreamChunk }
-'tool/call': { turn: number; step: number; callId: CallId; name: string; arguments: string }
+// packages/core/session/src/types.ts（当前版本；早期版本这里是逐 chunk 落盘的 'assistant/chunk'）
+'assistant/attempt': { turn: number; step: number; stream: AssistantStreamRecord[] }
+'tool/call': { turn: number; step: number; callId: ToolCallId; name: string; arguments: string }
 ```
 
-`assistant/chunk` 记录的是**逐 token 的原始流**，`tool/call` 记录的是模型发出的**原始调用**（`arguments` 是模型输出的原始 JSON 字符串，未解析）——这两类都不是"消息"，但对回放保真度至关重要（第三篇细讲）。
+> **2026-09 更新**：早期版本这里是 `'assistant/chunk': { turn: number; step: number; chunk: StreamChunk }`——每一个原始 chunk 单独落一条事件。现在这类事件已经不存在于当前 session 格式里（只在历史的 v0/v1 格式迁移代码中还能看到），换成了 `assistant/attempt`：一次模型请求尝试对应**一条**事件，携带一份紧凑打包过的 `stream: AssistantStreamRecord[]`（把连续的同类 delta 合并存储，但依然可以无损展开回原始的逐 chunk 时间序列）。第三篇《流式输出管道》详细讲了这个压缩算法和背后的动机。
+
+`assistant/attempt` 记录的是**逐 token 的原始流**（以紧凑形式），`tool/call` 记录的是模型发出的**原始调用**（`arguments` 是模型输出的原始 JSON 字符串，未解析）——这两类都不是"消息"，但对回放保真度至关重要（第三篇细讲）。
 
 **请求状态与日志专用记录**：
 
@@ -204,7 +207,7 @@ append<T extends SessionEventType>(
 }
 ```
 
-三个值得注意的点：**类型层面的强制**——TypeScript 的条件类型 `T extends SurfaceEventType ? [opts: SurfaceIntent] : []` 让"三种 surface 事件必须带 `surfaceOp`，其余事件禁止带"这个约束在编译期就能被检查到，不需要等运行时才发现某个事件漏写了 `surfaceOp`；**运行时的 JSON 无损校验**——`snapshotJsonValue` 会拒绝 `BigInt`、函数、`Symbol`、循环引用等一切不能被无损序列化成 JSON 的值,因为日志必须能被逐字节持久化和重放；**deepFreeze**——一旦事件写进日志,连它自身都是深度冻结的,任何后续代码都不可能"悄悄改一下已经落盘的历史"。
+三个值得注意的点：**类型层面的强制**——TypeScript 的条件类型 `T extends SurfaceEventType ? [opts: SurfaceIntent] : []` 让"四种 surface 事件必须带 `surfaceOp`，其余事件禁止带"这个约束在编译期就能被检查到，不需要等运行时才发现某个事件漏写了 `surfaceOp`；**运行时的 JSON 无损校验**——`snapshotJsonValue` 会拒绝 `BigInt`、函数、`Symbol`、循环引用等一切不能被无损序列化成 JSON 的值,因为日志必须能被逐字节持久化和重放；**deepFreeze**——一旦事件写进日志,连它自身都是深度冻结的,任何后续代码都不可能"悄悄改一下已经落盘的历史"。
 
 ### 案例：RuntimeContextProjection——只读日志、增量维护自己的投影
 
@@ -253,7 +256,7 @@ export class RuntimeContextProjection {
 
 ## 小结
 
-- 会话的唯一事实来源是一份 append-only、深度冻结、强 JSON 校验的事件日志；`SessionEventMap` 里的事件分为"产生消息"（三种 Surface 事件）和"不产生消息但记录过程"（边界标记、原始 chunk、请求头快照等）两大类。
+- 会话的唯一事实来源是一份 append-only、深度冻结、强 JSON 校验的事件日志；`SessionEventMap` 里的事件分为"产生消息"（四种 Surface 事件，含新加入的 `system/message`）和"不产生消息但记录过程"（边界标记、紧凑流记录 `assistant/attempt`、请求头快照等）两大类。
 - Surface 是日志之上的一层可重写索引：`append` 追加、`{ op: 'replace' }` 替换，替换只改变"当前可见范围",从不删除或修改原始事件——这就是"日志不可变、但可见视图可以折叠"的具体实现。
 - `deriveMessages()`、`requestHeader()`、`requestContext()` 都是"缓存 + 按需增量重折叠"的派生投影,而不是独立维护的可变状态；`replaceGeneration` 是判断"要不要整体重建缓存"的信号。
 - 任何需要"记住点什么、跨进程重启也要对得上"的插件，都应该参照 `RuntimeContextProjection` 的写法：构造时从日志回溯重建一次性状态，之后订阅 `session/event` 增量维护，绝不自己另开一份独立于日志的持久状态。

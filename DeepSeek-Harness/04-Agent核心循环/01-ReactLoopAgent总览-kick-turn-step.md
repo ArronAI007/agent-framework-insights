@@ -236,39 +236,47 @@ private async preStep(target: InboxTarget, position: { turn: number; step: numbe
 
 ### step()：一次模型调用与它触发的工具执行
 
-```typescript
-// packages/core/agent-loop/src/agent.ts（节选）
-private async step(assembly: PromptAssembly): Promise<StepEndReason | null> {
-  const { turn, step, abort: { signal } } = this.phase
-  const system = renderPrompt(assembly)
+> **2026-09 更新**：`step()` 的签名和内部实现相比早期版本有明显演进——参数从裸的 `assembly: PromptAssembly` 变成了 `preStep()` 返回的完整 `decision`（携带 `messages`/`assembly`/`startsRequestSeries`），流式消费也从"直接用 `BlockAssembler` 边落盘边组装"重构成了通过 `AssistantStreamAttempt` 这个专门的封装类来做（细节见下一篇《流式输出管道》）。下面按当前 `packages/core/agent-loop/src/agent.ts` 的真实实现讲解，不再是早期版本的简化骨架。
 
+```typescript
+// packages/core/agent-loop/src/agent.ts（节选，省略请求重试与系统提示词落盘部分）
+private async step(decision: Extract<PreparedStep, { kind: 'enter' }>): Promise<StepEndReason | null> {
+  if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": step outside running phase`)
+  const { turn, step, abort: { signal } } = this.phase
+  signal.throwIfAborted()
+
+  const { assembly } = decision
+  const renderedPrompt = renderPrompt(assembly)
+  let firstAttempt = true
   while (true) {
-    const { request, preparedCall } = await this.buildRequest(
-      turn, step, assembly.tools, system, this.session.deriveMessages(), signal,
+    const { config, preparedCall } = await this.prepareRequest(turn, step, signal)
+    // ... 系统提示词/用户消息落盘（略，和早期版本语义一致）
+    const request = this.buildRequest(config, preparedCall, assembly.tools, /* ... */)
+    const live = new AssistantStreamAttempt(
+      this.session.id, ++this.assistantAttemptCounter,
+      () => ++this.assistantStreamRevision, turn, step,
+      (frame) => { this.dispatch.emit('agent/assistant-stream', { frame }) },
     )
-    const assembler = new BlockAssembler()
-    const chunkSeqs: number[] = []
-    const stream = preparedCall?.stream(request) ?? this.loopCtx.llm.stream(request)
-    for await (const chunk of stream) {
-      chunkSeqs.push(this.session.append('assistant/chunk', { turn, step, chunk }).seq)
-      assembler.push(chunk)
+    try {
+      const stream = preparedCall?.stream(request) ?? this.loopCtx.llm.stream(request)
+      live.start()
+      for await (const chunk of stream) { live.push(chunk) }
+    } catch (error: unknown) {
+      // ... 取消时用 live.interruptedBlocks() 截取可见前缀，见正文
     }
-    const finish = assembler.finish
+    const finish = live.finish
     if (finish.kind === 'error' || finish.kind === 'aborted') {
       const action = await this.dispatch.waterfall(
         'agent/request-error', { turn, step, provider: request.provider, failure: finish.failure,
           retryPolicy: preparedCall?.retryPolicy, signal },
         () => Promise.resolve<RequestErrorAction>(undefined),
       )
-      if (action?.kind !== 'retry') {
-        throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
-      }
+      if (action?.kind !== 'retry') throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
       continue
     }
-
-    const message = createAssistantMessage({ content: assembler.blocks(), source: { /* ... */ } })
-    this.session.append('assistant/message', { turn, step, message, /* usage */ },
-      { surfaceOp: 'append', sourceEventSeqs: chunkSeqs })
+    const message = createAssistantMessage({ content: live.blocks(), source: { /* ... */ } })
+    live.settle('assistant/message', () => this.session.append('assistant/message',
+      { turn, step, message, stream: live.stream /* 紧凑记录，见下一篇 */ }, { surfaceOp: 'append' }).seq)
     if (finish.kind === 'max-tokens') return { kind: 'max-tokens' }
 
     const toolCalls = message.content.filter(block => block.type === 'tool-call')
@@ -282,7 +290,7 @@ private async step(assembly: PromptAssembly): Promise<StepEndReason | null> {
 }
 ```
 
-`step()` 内部还有一层 `while (true)`——这一层只服务于"模型请求失败后，插件通过 `agent/request-error` 决定重试"（下一篇细讲），一次成功的请求会走到 `continue` 之外的正常路径然后 `return`。抛开重试逻辑，一次 step 的骨架是：`buildRequest()` 组装冻结的请求 → 用 `BlockAssembler` 消费流式 chunk（每个原始 chunk 都先落盘再喂给组装器，第三篇细讲）→ 组装出完整的 `AssistantMessage` 并落盘 → 如果这条消息里没有 `tool-call` 内容块，step 直接 `completed`；如果有，调用 `executeToolCalls()` 执行它们。
+`step()` 内部还有一层 `while (true)`——这一层只服务于"模型请求失败后，插件通过 `agent/request-error` 决定重试"（下一篇细讲），一次成功的请求会走到 `continue` 之外的正常路径然后 `return`。抛开重试逻辑，一次 step 的骨架没有变：`buildRequest()`/`prepareRequest()` 组装请求 → 消费流式 chunk 并组装成完整内容块 → 组装出完整的 `AssistantMessage` 并落盘 → 如果这条消息里没有 `tool-call` 内容块，step 直接 `completed`；如果有，调用 `executeToolCalls()` 执行它们。真正变化的是"消费流式 chunk"这一步的内部机制：早期版本里 `step()` 自己持有一个 `BlockAssembler`，每个 chunk 到达时**先原样落盘一条 `assistant/chunk` 事件、再喂给组装器**；现在这件事被下放给了 `AssistantStreamAttempt`（`packages/core/agent-loop/src/assistant-stream.ts`）——它内部同时持有一个 `BlockAssembler`（用于组装最终内容块）和一个 `AssistantStreamAccumulator`（用于把连续的同类 delta 压缩打包成"紧凑记录"，而不是逐条落盘），并通过 `emit()` 把每个 chunk 转发成一个**不落盘、只做实时转发**的 `AssistantStreamFrame`（`start`/`chunk`/`end` 三种）。`step()` 只有在 `live.settle()` 时才真正往会话日志写一条事件——不再是 `assistant/chunk`，而是携带紧凑 `stream: AssistantStreamRecord[]` 的 `assistant/message`（或 `assistant/attempt`）。这个变化的动机、"紧凑记录"具体怎么保持无损，下一篇会详细展开，这里只需要知道：`step()` 依然是"一次模型调用 + 它触发的工具执行"的最小单元，工具调用不产生新 turn的判断逻辑（下面这段）完全没变。
 
 **这里就是"为什么工具调用不会产生新 turn"的答案**：`step()` 返回值只有三种——`{ kind: 'completed' }`、`{ kind: 'max-tokens' }`、或者 `null`。`null` 恰恰对应"工具执行完了，但没有一个工具结果显式声明 `concludesTurn: true`"，这意味着模型大概率还要针对工具结果再说点什么。`turn()` 外层循环看到 `step()` 返回 `null` 时，不会去开一个新 turn，而是把 `target` 切成 `'next-step'` 后继续同一个 `while` 循环，进入下一次 `preStep()` → `step()`。真正驱动"要不要再来一轮模型调用"的开关是 `concluded`：只要工具批次里任何一个结果携带 `concludesTurn: true`（比如"任务已完成，退出循环"类工具），`executeToolCalls` 就会返回 `concluded: true`，这一步就以 `completed` 收尾，turn 的外层循环再去检查 inbox、决定是否该收尾整个 turn。
 
