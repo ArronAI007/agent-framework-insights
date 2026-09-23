@@ -6,7 +6,7 @@
 
 - 理解 agent 测试相对传统软件测试多出的那个陷阱:被测系统(LLM)可以自己生成一段以假乱真的"成功报告",单靠这段报告做断言等于让考生自己判卷。
 - 理解 DeepSeek Harness 为什么坚持"不要吝惜真实 API 测试"(`We are DeepSeek — do not ration real-API tests`),以及这条策略与"只 mock 昂贵或不确定的边界"这条克制原则之间并不矛盾。
-- 搞清楚这个项目的测试分层(单元 / 覆盖率门禁 / 真实 API e2e / 快照 / Web 浏览器快照)各自能证明什么、不能证明什么,理解为什么它们不能互相替代。
+- 搞清楚这个项目的测试分层(单元 / 覆盖率门禁 / 真实 API e2e / 属主本地期望输出 / 性能基准 / 会话快照 / Web 浏览器快照)各自能证明什么、不能证明什么,理解为什么它们不能互相替代。
 - 通过真实测试文件 `apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts` 理解"验证外部世界,而非自我报告"这条规则在代码层面具体怎么写。
 - 理解"测试真实入口路径"规则如何专门堵住"手工搭建的插件测试全绿、真实产品在生产环境秒崩"这一类回归,并能复述 postmortem 0001 里这个故事的具体细节。
 - 理解覆盖率门禁的本质边界:它只能证明代码行被执行过,不能证明功能按交付方式正常工作。
@@ -21,17 +21,19 @@ DeepSeek Harness 用一次真实事故把这个抽象问题变成了具体教训
 
 ### 测试分层:每一层证明什么,不能证明什么
 
-`docs/testing.md` 开篇先把测试拆成五层,每一层职责单一,互不替代:
+`docs/testing.md` 开篇先把测试拆成七层(相对课程写作时新增了"属主本地期望输出"和"性能基准"两层),每一层职责单一,互不替代:
 
-> - **Unit** (`pnpm run test`): vitest over package and example specs under their `tests/**` directories … Prefer edge cases, error paths, event ordering, concurrency races, and permanent tests for contract regressions.
-> - **Coverage gate** (`pnpm run test:coverage`): the gating run, per-file 100% on `packages/*/*/src`. An uncovered line is often dead code the gate is correctly flagging for deletion, not a missing test to bolt on. Line coverage is necessary, never sufficient — it proves lines ran, not that the feature works as shipped.
-> - **Real-API e2e** (`pnpm run test:e2e`): with-key tests against live provider APIs …
-> - **Snapshot** (`pnpm run test:snapshot`): keyless expected outputs cover external behavior — transport contracts and presentation, while persisted logs pin assembled backend behavior.
-> - **Web browser snapshot** (`pnpm run test:web`; required Linux PR gate): Chromium compares replayed browser output with `apps/web/tests/snapshots/`.
+> - **Unit** (`pnpm run test`): vitest over package and example specs under their `tests/**` directories plus repository script specs under `scripts/**/*.spec.ts` … Every registry gets an HMR-safety test (dispose the contributing fiber, assert cleanup). Prefer edge cases, error paths, event ordering, concurrency races, and permanent tests for contract regressions.
+> - **Coverage gate** (`pnpm run test:coverage`): the gating run, per-file 100% on `packages/*/*/src`. An uncovered line is often dead code the gate flags for deletion, not a missing test to bolt on. Line coverage is necessary, never sufficient — it proves lines ran, not that the feature works as shipped.
+> - **Real-API e2e** (`pnpm run test:e2e`): with-key tests against live provider APIs — the DeepSeek model plus provider-specific smokes that gate on their own keys (`EXA_API_KEY`, `PERPLEXITY_API_KEY`, …); each suite self-skips without its key …
+> - **Owner-local expected output** (`pnpm run test:expected`): keyless assembled CLI/process expectations without a recorded-session round trip …
+> - **Performance benchmarks** (`pnpm run test:bench`; required Linux PR gate `node 24 / benchmarks`): `benchmarks/` groups user-path gates … Synthetic inputs enforce time, heap, and scaling budgets …
+> - **Snapshot** (`pnpm run test:snapshot`): a top-level scenario's highest recorded parent generation supplies user input and model replay, then serves as the expected persisted result …
+> - **Web browser snapshot** (`pnpm run test:web`; required Linux PR gate): Chromium compares session-driven output under `snapshots/web/` and UI-only output under `apps/web/tests/expected/` …
 >
 > —— `docs/testing.md`
 
-这五层各自守住一个"绝不能被别的层顶替"的证据类型。单元测试守住的是函数/模块内部逻辑的边界情况和事件顺序;覆盖率门禁守住的是"这条代码路径确实被执行过"这一最低门槛,但特别提醒了一句容易被误读的话——**行覆盖率是必要条件,永远不是充分条件**,它只证明代码跑过,不证明代码跑对了。真实 API e2e 守住的是"agent 真的能对接一个活的模型工作";快照守住的是"给定同一份输入,产出的协议消息/呈现内容/持久化日志没有意外漂移";Web 快照专门守住浏览器渲染这一层,因为很多问题(比如样式、DOM 结构)在 Node 环境的单元测试里根本没有对应的失败模式。
+这七层各自守住一个"绝不能被别的层顶替"的证据类型。单元测试守住的是函数/模块内部逻辑的边界情况和事件顺序(注册表的可逆卸载也由这一层的 HMR 安全测试机械强制);覆盖率门禁守住的是"这条代码路径确实被执行过"这一最低门槛,但特别提醒了一句容易被误读的话——**行覆盖率是必要条件,永远不是充分条件**,它只证明代码跑过,不证明代码跑对了。真实 API e2e 守住的是"agent 真的能对接一个活的模型工作";属主本地期望输出守住的是"不经过录制会话回放、直接组装出来的 CLI/进程行为没有漂移";性能基准把时长、堆内存、规模伸缩的预算做成了 Linux PR 门禁;会话快照守住的是"同一份录制的父代会话同时充当输入、模型回放与期望的持久化结果,三者没有意外漂移";Web 快照专门守住浏览器渲染这一层,因为很多问题(比如样式、DOM 结构)在 Node 环境的单元测试里根本没有对应的失败模式。
 
 这张分层表本身就是一种设计声明:任何一类 bug,都应该能被归类到"哪一层理应捕获它却没有捕获"。这也是为什么每一篇 postmortem 结尾都会明确指出新增了哪一层的哪个具体测试,而不是笼统地说"补了测试"。
 
@@ -39,7 +41,7 @@ DeepSeek Harness 用一次真实事故把这个抽象问题变成了具体教训
 
 `docs/testing.md` 用一句近乎宣言式的话给真实 API 测试正名:
 
-> We are DeepSeek — do not ration real-API tests. A no-key test proves plumbing; only a with-key run proves the agent works against a real model. Cover file-writing prompts, multi-turn conversations, tool use, and mid-stream cancellation. Highest-value are **smoke tests** that boot the real example, send one prompt, and check the world — they catch the "green unit tests, broken product" class that mocks cannot. Self-skip keeps secretless CI and keyless contributors unblocked; it is not a cost signal.
+> We are DeepSeek — do not ration real-API tests. A no-key test proves plumbing; only a with-key run proves the agent works against a real model. Cover file-writing prompts, multi-turn conversations, tool use, and mid-stream cancellation. Highest-value are **smoke tests** that boot a shipped `dsh` profile, send one prompt, and check the world — they catch the "green unit tests, broken product" class that mocks cannot. Self-skip keeps secretless CI and keyless contributors unblocked; it is not a cost signal.
 >
 > —— `docs/testing.md`
 
@@ -47,17 +49,17 @@ DeepSeek Harness 用一次真实事故把这个抽象问题变成了具体教训
 
 这条规则并不否定 mock 的价值,它和"优先使用真实实现而非 mock"这条规则是同一枚硬币的两面:
 
-> Mock only the expensive or non-deterministic boundary (LLM adapter, network, clock); keep everything downstream real. A hand-rolled stand-in proves the bridge moves bytes, not that the shipping tool behaves as asserted. Bridge tool-call tests use the scripted mock model with the real tool and executor: `makeBridgeHarness({ withBash: true })` plugs in `dsh-bash-local` and `dsh-tool-bash`, then runs `echo`.
+> Mock only the expensive or non-deterministic boundary (LLM adapter, network, clock); keep everything downstream real. A hand-rolled stand-in proves the bridge moves bytes, not that the shipping tool behaves as asserted. Bridge tool-call tests keep the real tool registry and pipeline behind the scripted mock model: `makeBridgeHarness()` mounts the loop, session store, tool registry, and JSONL persistence with a `MockAdapter` as the only mock (`packages/acp/acp/tests/harness.ts`).
 >
 > —— `docs/testing.md`
 
-两条规则合起来的意思是:mock 的边界应该尽量收窄到"确实昂贵或确实不确定"的那一层(模型调用、网络、时钟),下游的工具执行器、沙箱、持久化等等都应该用真实实现跑起来。而对"模型调用"这一层本身,策略不是永远 mock,而是分场景——**冒烟测试(smoke test)必须带着真实模型跑**,因为它要证明的正是这一层的真实行为;而"桥接层是否正确搬运字节"这类问题,可以用脚本化的 mock 模型配合真实工具执行器来验证,因为这里要证明的是下游链路而不是模型本身。
+两条规则合起来的意思是:mock 的边界应该尽量收窄到"确实昂贵或确实不确定"的那一层(模型调用、网络、时钟),下游的工具执行器、沙箱、持久化等等都应该用真实实现跑起来。而对"模型调用"这一层本身,策略不是永远 mock,而是分场景——**冒烟测试(smoke test)必须带着真实模型跑**,因为它要证明的正是这一层的真实行为;而"桥接层是否正确搬运字节"这类问题,可以用脚本化的 mock 模型配合真实的工具注册表与执行管线来验证(`MockAdapter` 是那个 harness 里唯一的 mock),因为这里要证明的是下游链路而不是模型本身。
 
 ### "Verify the world, not the self-report":拒绝关键词探测式断言
 
 这是本篇标题直接引用的那句话,也是整套测试哲学里最反直觉、最需要单独强调的一条:
 
-> An e2e assertion re-runs the command or re-reads the file externally; a keyword probe on the agent's own output lets a cheating agent pass. Assert untouched files are byte-identical. e2e tests own their resources: create the harness in the test, dispose in `afterEach` (even on failure/retry/timeout); shared fixtures live in a plain `tests/harness.ts`, never another `*.e2e.ts` (importing a spec re-registers its `describe` and duplicates real API calls).
+> An e2e assertion re-runs the command or re-reads the file externally; a keyword probe on the agent's own output lets a cheating agent pass. Assert untouched files are byte-identical. e2e tests own their resources: create it in the test, dispose in `afterEach` (even on failure/retry/timeout); shared fixtures live in a plain `tests/harness.ts`, never another `*.e2e.ts` (importing a spec re-registers its `describe` and duplicates real API calls).
 >
 > —— `docs/testing.md`
 
@@ -79,7 +81,7 @@ DeepSeek Harness 用一次真实事故把这个抽象问题变成了具体教训
 ```typescript
 // apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts
 // The agent claims success…
-const summary = finalText([...agent.session.events]).toLowerCase()
+const summary = finalText(agent.session.snapshotEvents()).toLowerCase()
 expect(summary.length).toBeGreaterThan(0)
 
 // …and the world agrees: the test passes when WE run it, and the test
@@ -105,7 +107,7 @@ expect(fixed).not.toMatch(/a\s*-\s*b/)
 
 值得注意的是,测试在调用 agent 之前还专门确认了 fixture 本身是坏的(`const before = spawnSync(...); expect(before.status).not.toBe(0)`)——这是"验证外部世界"原则的另一半:既要验证修复后的状态,也要验证修复前的状态确实处于"需要被修复"的起点,防止一个什么都没做的 agent 因为 fixture 本身凑巧能跑通而"通过"。
 
-这条规则还带出一个容易被忽略的资源管理约定:"e2e tests own their resources: create the harness in the test, dispose in `afterEach` … shared fixtures live in a plain `tests/harness.ts`, never another `*.e2e.ts`"。`coding-task.e2e.ts` 里的 `afterEach` 精确对应这条约定:
+这条规则还带出一个容易被忽略的资源管理约定:"e2e tests own their resources: create it in the test, dispose in `afterEach` … shared fixtures live in a plain `tests/harness.ts`, never another `*.e2e.ts`"。`coding-task.e2e.ts` 里的 `afterEach` 精确对应这条约定:
 
 ```typescript
 // apps/cli/tests/profiles/headless/tests/coding-task.e2e.ts
@@ -127,7 +129,7 @@ afterEach(async () => {
 
 > Product-visible plugins require a non-unit REAL-composition test. Hand-built `ctx.plugin(...)` suites are insufficient: boot test-only `cordis.yml` through Loader and app/process, mock only external services or nondeterministic inputs, and assert model-visible request/log, durable state, or user-visible output. Keep opt-ins out of shipped defaults.
 >
-> A guard only guards if the regression actually fails it. For a plugin without `inject` (bundle/composition plugins), a Loader smoke stays green when a default export replaces the required named exports — add an explicit `expect('default' in mod).toBe(false)` plus an `unwrapExports` round-trip assertion, and prove it: introduce the regression, watch red, revert.
+> A guard only guards if the regression fails it. For a plugin without `inject` (bundle/composition plugins), a Loader smoke stays green when a default export replaces the required named exports — add an explicit `expect('default' in mod).toBe(false)` plus an `unwrapExports` round-trip assertion, and prove it: introduce the regression, watch red, revert.
 >
 > —— `docs/testing.md`
 
@@ -148,7 +150,9 @@ postmortem 0001 把这个抽象规则变成了一个具体故事。ACP 插件 `p
 
 存在默认导出时,`exports.default ?? exports` 解析出的是裸 `apply` 函数,而 `inject`/`name`/`Config` 作为*同级*具名导出全部被丢弃——`apply` 于是在一个**没有注入任何服务**的 fiber 里运行,第一行读取 `ctx.agents` 就直接抛出异常。这个 bug 只会在真实 Loader 加载路径上出现,而 178 个单元测试之所以全部绿灯,是因为它们全部通过手动构建的 `ctx.plugin({ name, inject, apply })` 挂载 bridge——**这行代码手动把 `inject` 喂给了 Cordis,而 `unwrapExports` 只在真实 Loader 里被调用**,`ctx.plugin` 从来不会走到这一步。也就是说,不是测试写少了,而是所有测试统一地避开了唯一会暴露 bug 的那条路径。
 
-规则里"A guard only guards if the regression actually fails it"这句话,对应的正是这次事故留下的修复方法论:新增的守卫测试不能停留在"我觉得它能捕获问题",而必须真的把 bug 复现一遍、看着测试变红、再撤回去确认变绿——用实际红绿切换来证明这个守卫有效,而不是靠阅读代码"想象"它有效。postmortem 0001 里也确实记录了这一步:"已验证恢复 `export default apply` 时测试失败"。
+规则里"A guard only guards if the regression fails it"这句话,对应的正是这次事故留下的修复方法论:新增的守卫测试不能停留在"我觉得它能捕获问题",而必须真的把 bug 复现一遍、看着测试变红、再撤回去确认变绿——用实际红绿切换来证明这个守卫有效,而不是靠阅读代码"想象"它有效。postmortem 0001 里也确实记录了这一步:"已验证恢复 `export default apply` 时测试失败"。
+
+这一节后来又补出了第三层含义:"真实入口路径"最终指的是*发布产物*本身——包的 `bin` 要在纯 `node` 下运行构建出来的 `lib/bin.js`,因为 tsx 的源码加载会掩盖掉一批只有构建产物才暴露的失败(settle 竞争、模块解析、被吞掉的加载失败)。仓库里因此有一类专门的 built-artifact 冒烟测试(如 `packages/sdk/server/tests/built-scope-carrier.e2e.ts`、`packages/ptc-runtime/ptc-runtime-node/tests/built-lib.e2e.ts`)守着这条路,并要求一个真正缺失的配置必须以非零码退出。
 
 ### 覆盖率门禁的边界:它证明什么,不证明什么
 
@@ -164,11 +168,11 @@ postmortem 0001 把这个抽象规则变成了一个具体故事。ACP 插件 `p
 
 `docs/testing.md` 还有一条容易被忽略、但和会话事件溯源设计直接呼应的规则:
 
-> Every non-trivial model-, protocol-, or human-visible change adds or updates a keyless scenario in the same PR through a runnable example's owning snapshot suite. Package tests, e2e assertions, mock/test-only compositions, and PR rationale do not replace the assembled transcript; extend the harness when needed.
+> Every non-trivial model-, protocol-, or human-visible change adds or updates a keyless recorded-session scenario in the same PR; package, e2e, mock-only, and rationale evidence does not replace the assembled transcript. Headless, SDK, ACP, and Web recordings live under `snapshots/session/`, `snapshots/sdk/`, `snapshots/acp/`, and `snapshots/web/` …
 >
 > —— `docs/testing.md`
 
-这条规则表面上是一条测试流程要求,骨子里是把"模型可见的东西必须能被完整重建"这条架构不变量,转译成了一条对*测试*同样成立的义务:如果一次改动会影响模型看到的内容、协议消息或者用户可见的呈现,那么光靠包内单元测试、e2e 断言、或者 PR 描述里"我确认过没问题"这类理由都不够,必须在同一个 PR 里让某个可运行示例的快照套件真正跑出一份组装后的 transcript(文本记录)并把它提交进版本库。换句话说,"模型可见"这件事本身自带一条举证责任:任何声称改变了模型可见内容的改动,都要留下一份可以被后续任何人重新比对的具体证据,而不是停留在开发者自己的描述里——这和前一节讲的"验证外部世界,而非自我报告"其实是同一种不信任自我陈述的态度,只是这一次不信任的对象从"agent 的自我报告"换成了"PR 作者的自我陈述"。
+这条规则表面上是一条测试流程要求,骨子里是把"模型可见的东西必须能被完整重建"这条架构不变量,转译成了一条对*测试*同样成立的义务:如果一次改动会影响模型看到的内容、协议消息或者用户可见的呈现,那么光靠包内单元测试、e2e 断言、或者 PR 描述里"我确认过没问题"这类理由都不够,必须在同一个 PR 里让对应入口(headless / SDK / ACP / Web)的录制会话快照套件真正跑出一份组装后的 transcript(文本记录)并把它提交进版本库。换句话说,"模型可见"这件事本身自带一条举证责任:任何声称改变了模型可见内容的改动,都要留下一份可以被后续任何人重新比对的具体证据,而不是停留在开发者自己的描述里——这和前一节讲的"验证外部世界,而非自我报告"其实是同一种不信任自我陈述的态度,只是这一次不信任的对象从"agent 的自我报告"换成了"PR 作者的自我陈述"。
 
 ## 常见问题/易踩坑
 

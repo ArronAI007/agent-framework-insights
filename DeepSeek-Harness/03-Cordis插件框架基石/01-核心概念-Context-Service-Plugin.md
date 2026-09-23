@@ -228,40 +228,48 @@ export function apply(ctx: Context): void {
 - **`apply(ctx)` 只做一行事**：调用 `ctx.sessionProjections.register(...)`，把真正的统计逻辑（读取整段会话日志、折叠出轮次/步数计数和耗时）委托给 `./projection.ts` 里的纯函数定义。插件文件本身不关心"怎么统计"，只关心"往哪个服务里挂"。
 - 注释里那句 "the registration is an effect on this plugin's fiber, so unloading removes the key" 已经在预告下一篇的内容：`register()` 的返回值不是这里被丢弃了，而是内部已经自动绑定到了当前插件的生命周期上。
 
-对比一下另一个同样极简、但用 `ctx.effect()` 显式包裹注册调用的例子，`packages/session-query/session-log-export/src/index.ts`：
+对比一下另一个用 `ctx.effect()` 显式包裹注册调用的例子，`packages/session-query/session-log-export/src/index.ts`（这个插件还往 `connection` 服务注册了一条认证下载路由，这里只节取命令注册的部分）：
 
 ```ts
-// packages/session-query/session-log-export/src/index.ts
-import type { Context } from '@deepseek-ai/cordis'
-import type { CommandResult } from '@deepseek-ai/dsh-commands'
-
+// packages/session-query/session-log-export/src/index.ts（节选）
 export const name = 'session-log-download'
-export const inject = ['commands']
+export const inject = ['commands', 'connection']
 
 const REQUESTED: CommandResult = {
   kind: 'success',
   text: 'Session log download requested.',
 }
 
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: Config = {}): void {
   ctx.effect(() => ctx.commands.register({
+    definitionId: brandString<CommandDefinitionId>('@deepseek-ai/dsh-session-log-export'),
     name: 'export',
     description: 'Download this Session log as a ZIP archive',
     handler: invocation => Promise.resolve(invocation.rawInput.trim() === ''
       ? REQUESTED
       : { kind: 'error', text: 'The Web /export command does not accept a path.' }),
   }), 'session-log-download: command')
+  // ...registers the authenticated ZIP download route on the connection service...
 }
 ```
 
-两个例子的共性远大于差异：`inject` 声明一个硬依赖服务名字，`apply` 里只做"注册一件东西"这一件事。差异只是 `ctx.tools`/`ctx.sessionProjections`/`ctx.commands` 这类注册表的 `register()` 方法本身是否已经内部调用了 `ctx.effect()`——`dsh-commands` 的作者选择让调用方显式包一层，`dsh-session-projections` 的作者选择在 `register()` 内部就做好。这正是下一篇要讲的话题。
+两个例子的共性远大于差异：`inject` 声明硬依赖的服务名字（这个插件依赖两个——命令注册表和连接服务），`apply` 的主体是"注册东西"。值得澄清的一个细节是：`ctx.tools`/`ctx.sessionProjections`/`ctx.commands` 这几个注册表的 `register()` 方法如今**都**在内部把插入动作包成了 effect（第三篇会看到 `dsh-tools` 与 `dsh-commands` 的实现），所以这里外层再套一层 `ctx.effect()` 不是卸载正确性的必需——内层 `register()` 返回的 disposer 本来就会随 Fiber 卸载。显式外层的价值是第二个参数：标签 `'session-log-download: command'` 会出现在 Fiber 的 effect 诊断清单里，排错时能一眼认出这笔注册来自哪个插件、注册的是什么。这正是下一篇要讲的话题。
 
 ### 一个真实的 Service Definition：`SpillStore`
 
 `Service` 子类不只是"class 形态的插件"，它还承担着**定义一个服务契约**的角色。`packages/spill/spill/src/index.ts` 是一个体量刚好合适、语义清晰的例子：
 
 ```ts
-// packages/spill/spill/src/index.ts
+// packages/spill/spill/src/index.ts（节选）
+/**
+ * Service Definition for the spill storage capability seam (`ctx.spillStore`): an abstract service defining WHAT a
+ * spill backend does — persist oversized text and return a model-facing
+ * locator plus retrieval guidance — without saying HOW. Implementations
+ * subclass {@link SpillStore} and register as the `spillStore` service;
+ * `@deepseek-ai/dsh-spill-local` (host filesystem) is the first.
+ * ...（文件头注释的其余部分从略）
+ */
+
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { SaveTextSpill, SpillRef } from './types.ts'
 
@@ -276,6 +284,7 @@ declare module '@deepseek-ai/cordis' {
  * the subclass as a plugin — it registers as `ctx.spillStore` (one
  * implementation per context; loading a second throws, cordis' standard
  * duplicate-service behavior).
+ * ...（实现者须遵守的语义条款从略）
  */
 export abstract class SpillStore extends Service {
   constructor(ctx: Context) {
@@ -306,4 +315,4 @@ export default SpillStore
 
 Cordis 的核心心智模型可以归纳成一句话：**Context 是一个按名字索引的服务仓库，Plugin 是往这个仓库里读写的独立单元，`inject` 是插件对仓库内容的显式依赖声明**。三种插件形态（函数、对象、类）只是"往仓库里写"这件事的三种语法，`Service` 基类额外承担了"定义一个可被继承、可被替换的服务契约"的角色。真实的 dsh 代码——无论是 29 行的 `session-stats` 还是抽象的 `SpillStore`——都严格遵循这套心智模型，这也是为什么本章开头说"没有一处是框架核心不可替换的部分"：换掉任何一个服务名字背后的实现，都只是换一个插件，而不是改一处特殊逻辑。
 
-下一篇《Typed Events 与四种派发模式》会讲清楚：当插件之间不需要"直接调用对方方法"、只需要"通知对方发生了什么、或者请对方决定要不要拦截"时，Cordis 提供的另一套通信机制——Typed Events——是怎么工作的。
+下一篇《Typed Events 与五种派发模式》会讲清楚：当插件之间不需要"直接调用对方方法"、只需要"通知对方发生了什么、或者请对方决定要不要拦截"时，Cordis 提供的另一套通信机制——Typed Events——是怎么工作的。

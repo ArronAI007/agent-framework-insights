@@ -19,10 +19,10 @@
 ```jsonc
 // tsconfig.client.json
 {
-  // Client-side typecheck aggregate: packages/client tests (.ts and .tsx).
+  // Client-side typecheck aggregate: packages/client tests and top-level Client benchmarks.
   // Split from the host aggregate because both sides merge cordis Context
   // under the same keys (sessions, loader) with different services; shared
-  // leaves (session/llm/tools/apiproxy/...) build once and are referenced by
+  // leaves (session/llm/tools/...) build once and are referenced by
   // both programs through each client package's own references.
   "extends": "./tsconfig.base.client.json",
   ...
@@ -64,7 +64,7 @@ interface Context {
 }
 ```
 
-关键是 `"files": []`。TypeScript 的 Project References 模式下,一个 solution 文件如果自己不声明任何 `files`/`include`,就永远不会被实例化成一个真正的 `ts.Program`——它只是给 `tsc -b`(批量构建)和 tsserver(编辑器智能提示)一个"这里有两个独立子工程"的路标。注释里写得很直白:**永远不要往这个文件加 `include`/`files`,永远不要把这个 solution 压平成单一 `ts.Program`**——这两条禁令直接对应前面讲的合并风险。同时它 `extends` 了 `tsconfig.base.json`,这样像 `tsx` 这种没有更贴近的 tsconfig 可用的场景(运行 `examples/` 或 `scripts/` 下的脚本),依然能通过这份基础路径映射解析到工作区内的包。
+关键是 `"files": []`。TypeScript 的 Project References 模式下,一个 solution 文件如果自己不声明任何 `files`/`include`,就永远不会被实例化成一个真正的 `ts.Program`——它只是给 `tsc -b`(批量构建)和 tsserver(编辑器智能提示)一个"这里有两个独立子工程"的路标。注释里写得很直白:**永远不要往这个文件加 `include`/`files`,永远不要把这个 solution 压平成单一 `ts.Program`**——这两条禁令直接对应前面讲的合并风险。同时它 `extends` 了 `tsconfig.base.json`,这样像 `tsx` 这种没有更贴近的 tsconfig 可用的场景(运行 `scripts/` 下的脚本),依然能通过这份基础路径映射解析到工作区内的包。
 
 ### `tsconfig.host.json`:Node 端聚合工程
 
@@ -83,7 +83,6 @@ interface Context {
     "apps/web/tests/scaffold.ts",
     ...
     "apps/cli/tests/**/*.ts",
-    "examples/*/src/**/*.ts",
     "packages/*/*/tests/**/*.ts",
     "scripts/**/*.ts",
     ...
@@ -123,8 +122,9 @@ interface Context {
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "jsx": "react-jsx",
-    "lib": ["ES2024", "DOM", "DOM.Iterable"],
-    "types": []
+    "lib": ["ES2024", "DOM", "DOM.Iterable", "ESNext.Disposable"],
+    "typeRoots": ["./scripts/types", "./node_modules/@types"],
+    "types": ["client-build-environment"]
   }
 }
 ```
@@ -167,7 +167,7 @@ interface Context {
 
 注意这里 `types` 反而被设成了 `["node"]`——注释解释得很清楚:**这份聚合工程编译的是测试文件**,测试跑在 vitest 之上、跑在 Node 进程里(e2e 测试还会 spawn 子进程),所以测试代码需要 Node 类型;而"包源码本身是否保持浏览器纯净"是另一件事,由每个客户端包自己的 tsconfig(继承 `tsconfig.base.client.json`,`types: []`)加上 `scripts/client-bundle-purity.spec.ts` 这个专门的构建期校验来保证。这是"测试聚合工程的类型环境"和"被测源码的类型环境"故意错开的一个细节。
 
-`references` 里能看到**共享叶子包**同时出现在 Host 和 Client 的引用列表里,比如 `packages/compaction/compaction`。这些包(`session`、`llm`、`tools`、`apiproxy` 等)本身不依赖 Cordis 的 `Context` 类型合并——它们只导出纯类型或不含跨插件运行时身份的东西,所以可以只构建一次,被两个程序分别引用,而不违反"两侧合并互不可见"的约束。
+`references` 里能看到**共享叶子包**同时出现在 Host 和 Client 的引用列表里,比如 `packages/compaction/compaction`。这些包(`session`、`llm`、`tools` 等)本身不依赖 Cordis 的 `Context` 类型合并——它们只导出纯类型或不含跨插件运行时身份的东西,所以可以只构建一次,被两个程序分别引用,而不违反"两侧合并互不可见"的约束。
 
 ### 两侧真的会挂载同名键,不同类型:一个可验证的例子
 
@@ -220,7 +220,7 @@ declare module '@deepseek-ai/cordis' {
 "build:lib:client": "tsc -b tsconfig.client.json && tsdown --env.DSH_BUILD_FACE client",
 ```
 
-（脚本管理器从 npm 换成了 pnpm,这和第 01 篇讲的 `pnpm-workspace.yaml` 是一致的;Host 侧的 `tsc -b` 现在还多了一层显式的 `node --max-old-space-size=4096` 包装——这是仓库体量继续增长后,Host 聚合工程的类型检查图变得足够大,需要手动把 V8 堆上限调高才能稳定跑完的直接证据,侧面印证了第 01 篇"叶子包从 219 涨到 291"这件事对工程侧的真实代价。）
+（脚本管理器从 npm 换成了 pnpm,这和第 01 篇讲的 `pnpm-workspace.yaml` 是一致的;Host 侧的 `tsc -b` 现在还多了一层显式的 `node --max-old-space-size=4096` 包装——这是仓库体量继续增长后,Host 聚合工程的类型检查图变得足够大,需要手动把 V8 堆上限调高才能稳定跑完的直接证据,侧面印证了第 01 篇"叶子包从 219 涨到 307"这件事对工程侧的真实代价。）
 
 每一面先用对应的 `tsc -b` 把 TypeScript 降级成 JavaScript(降级到各自 `lib/types` 目录),再用 tsdown 把 JS 打包成最终发布产物。`tsdown.config.ts` 就是这条分流的入口:
 
@@ -276,12 +276,13 @@ export function clientBundle(
   const lib = clientLibraryConfig(id, libEntry, options.lib)
   return ({ env }) => {
     const face = buildFace(env?.DSH_BUILD_FACE)
-    const client = clientConfig(id, face === undefined
-      ? 'src/client/index.ts'
-      : 'lib/types/client/index.js')
+    const clientEntry = face === undefined ? 'src/client/index.ts' : 'lib/types/client/index.js'
+    const client = clientConfig(id, clientEntry, options.clientBanner)
     const node = [lib, ...(options.companions ?? [])]
     if (face === 'host') return options.hostPhase === true ? node : [SKIP_WORKSPACE_BUILD]
-    if (face === 'client') return options.hostPhase === true ? [client] : [...node, client]
+    if (face === 'client') {
+      return options.hostPhase === true ? [client] : [...node, client]
+    }
     return [...node, client]
   }
 }

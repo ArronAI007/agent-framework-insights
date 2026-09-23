@@ -235,6 +235,8 @@ landlock-run --probe
 - `--rw <path>`: grant full filesystem access beneath `<path>` (every access
   the negotiated kernel ABI can govern).
 - Everything not granted is denied — Landlock rulesets are allow-lists.
+- A grant on a non-directory keeps only its file-compatible access bits (this
+  is how a `--rw /dev/null` grant works).
 - `--`: mandatory separator; everything after it is the command argv, exec'd
   via `execvp` with the launcher's environment unchanged.
 - `--probe`: mutually exclusive with grants and a command.
@@ -291,7 +293,7 @@ export function grantArgs(grants: LauncherGrants): string[] {
 `test/entry.test.js` 里锁死了拼接顺序（只读参数在前,读写在后,与调用者传参顺序无关）：
 
 ```js
-// native/system/test/entry.test.js:24-31
+// native/system/test/entry.test.js:29-35
 assert.deepEqual(grantArgs({}), []);
 assert.deepEqual(grantArgs({ readOnly: ['/'] }), ['--ro', '/']);
 assert.deepEqual(
@@ -430,7 +432,7 @@ return fail("exec failed", strerror(errno));
 消费方 `packages/sandbox/sandbox-local/src/index.ts` 把这条"125 + `landlock-run: ` 前缀"的信号接进自己的失败分类规则里：
 
 ```ts
-// packages/sandbox/sandbox-local/src/index.ts:231-237(节选)
+// packages/sandbox/sandbox-local/src/index.ts:233-241(节选)
 const RUNNER_FAILURE_RULES = {
   bwrap: [{ fatalSignatures: ['bwrap: '] }],
   landlock: [{
@@ -493,7 +495,7 @@ if (partial) {
 `docs/support-matrix.md` 同样把"探测结果本身才是权威,内核版本号不是"这条原则保留了下来,只是随着这次改名/合并把措辞改得更简练（原来单独一句话,现在拆成了两句,并且顺带把 darwin 平台也列进了矩阵——但 darwin 只是拿到了 flock 的 Node-API addon,并不代表 macOS 上有了 Landlock 支持,Landlock 依然是纯 Linux 能力）：
 
 ```text
-// native/system/docs/support-matrix.md:10-12
+// native/system/docs/support-matrix.md:12-21
 Landlock additionally requires an enforcing Linux kernel. The functional
 probe determines full, partial, or unusable enforcement; kernel version
 alone is not an availability guarantee.
@@ -541,7 +543,7 @@ assert.ok(!fs.existsSync(nested), 'a denied write from a nested child must not l
 `packages/sandbox/sandbox-local/src/profiles.ts` 里,`landlockProfileArgs` 只负责把 dsh 内部统一的 `SandboxPolicy` 翻译成 landlock-run 的授权参数：
 
 ```ts
-// packages/sandbox/sandbox-local/src/profiles.ts:25-36
+// packages/sandbox/sandbox-local/src/profiles.ts:30-37
 export function landlockProfileArgs(policy: SandboxPolicy): string[] {
   const readWrite = ['/dev/null']
   if (policy.mode === 'workspace-write') {
@@ -554,7 +556,7 @@ export function landlockProfileArgs(policy: SandboxPolicy): string[] {
 同一个文件里,`bwrapProfileArgs` 和 `seatbeltProfileArgs`(macOS 的 Seatbelt 沙箱)与它并列存在——三种后端消费的是同一份 `SandboxPolicy` 抽象,只是各自翻译成自己认识的命令行参数。真正决定"这台机器该用哪个后端"的是 `index.ts` 里的平台选择链：
 
 ```ts
-// packages/sandbox/sandbox-local/src/index.ts:159-166
+// packages/sandbox/sandbox-local/src/index.ts:160-167
 const PLATFORM_CHAINS: Record<string, readonly SelectedRunner['runner'][]> = {
   linux: ['bwrap', 'landlock'],
   darwin: ['seatbelt'],
@@ -565,7 +567,7 @@ const PLATFORM_CHAINS: Record<string, readonly SelectedRunner['runner'][]> = {
 Linux 上 `bwrap` 排在 `landlock` 之前——只有 `bwrap` 探测不可用(权限不足、二进制不存在)时,才会降级尝试 `landlock`。真正拼出 argv 的地方,Landlock 分支就是本篇反复出现的 `[launcherPath(), ...grantArgs(...)]` 模式：
 
 ```ts
-// packages/sandbox/sandbox-local/src/index.ts:339-347(节选)
+// packages/sandbox/sandbox-local/src/index.ts:341-348(节选)
 private runnerArgv(runner: SelectedRunner['runner'], policy: SandboxPolicy): string[] {
   switch (runner) {
     case 'bwrap': return ['bwrap', ...bwrapProfileArgs(policy)]
@@ -580,7 +582,7 @@ private runnerArgv(runner: SelectedRunner['runner'], policy: SandboxPolicy): str
 选择 `landlock` 分支前,会先跑一次探测,复用的正是本篇讲过的 `probe()`：
 
 ```ts
-// packages/sandbox/sandbox-local/src/index.ts:528-531(节选)
+// packages/sandbox/sandbox-local/src/index.ts:529-532(节选)
 case 'landlock': {
   const probe = this.internals.probeLandlock ?? (launcher => defaultProbeLandlock(launcher, { timeoutMs: this.probeTimeoutMs }))
   return probe(this.landlockLauncher())

@@ -1,14 +1,14 @@
 # CLI 命令与 Profile 机制
 
-> `dsh` 的命令行只做一件"元"层面的事：决定装配哪一棵插件树、往树上叠加哪些补丁、以及要不要真的启动它。`profile`、`plugin`、`dump-config` 三种模式分别对应"启动"、"给某个 Profile 装插件依赖"、"只打印装配结果不启动"——搞懂这三者的边界，再配合 `--dump-config` 这个调试利器，你会发现 `dsh` 的启动行为完全是可预测、可审查的，没有任何"黑魔法"。
+> `dsh` 的命令行只做一件"元"层面的事：决定装配哪一棵插件树、往树上叠加哪些补丁、以及要不要真的启动它。`profile`、`plugin`、`dump-config`、`dump-config-schema` 四种模式分别对应"启动"、"给某个 Profile 装插件依赖"、"只打印装配结果不启动"、"只打印装配树的配置 Schema 不启动"——搞懂这四者的边界，再配合 `--dump-config` 这个调试利器，你会发现 `dsh` 的启动行为完全是可预测、可审查的，没有任何"黑魔法"。
 
 ## 学习目标
 
-- 读懂 `apps/cli/src/args.ts` 里三种命令行模式（`profile`/`plugin`/`dump-config`）的解析逻辑与边界规则。
+- 读懂 `apps/cli/src/args.ts` 里四种命令行模式（`profile`/`plugin`/`dump-config`/`dump-config-schema`）的解析逻辑与边界规则。
 - 理解 Profile 的物理结构：`$DSH_HOME/profiles/<name>` 目录下有什么，`dsh.profile.bundles` 字段如何决定叠加哪些 Bundle。
 - 理解 `profile-boot.ts` 里补丁层的叠加顺序：Bundle 层 → Profile 自己的 `cordis.patch.yml` → Home 级用户层 → `--patch` 覆盖层。
 - 会用 `dsh --profile headless "task"` 跑一次无人值守的一次性任务。
-- 会用 `dsh --profile <name> --dump-config` 在不启动任何进程的情况下，审查一个 Profile 最终装配出的插件树。
+- 会用 `dsh --profile <name> --dump-config` 在不启动任何进程的情况下，审查一个 Profile 最终装配出的插件树；以及用 0.1.7 新增的 `--dump-config-schema` 导出这棵树声明的 JSON Schema。
 - 理解 `dsh <name>` 是怎么在参数解析层面变成 `dsh --profile <name>` 的通用简写（不再只是 `web` 一个硬编码特例），以及 `--from-default-profile` 如何从官方模板新建一个自定义 Profile。
 
 ## 背景与设计动机
@@ -17,7 +17,7 @@
 
 ## 核心机制详解
 
-### 命令行的三种模式
+### 命令行的四种模式
 
 `apps/cli/src/args.ts` 用 `commander` 解析出一个判别联合类型 `DshInvocation`：
 
@@ -29,7 +29,9 @@ interface ProfileInvocation {
   profile: string
   /** Shipped template used once to initialize a missing profile. */
   fromDefaultProfile?: string | undefined
+  /** Extra patch-list overlays applied after the profile's own layer, in argv order. */
   patches: string[]
+  /** Everything after the launcher's own flags, verbatim, for injected app plugins. */
   args: string[]
 }
 
@@ -39,7 +41,17 @@ interface DumpConfigInvocation {
   profile: string
   /** Shipped template used once to initialize a missing profile. */
   fromDefaultProfile?: string | undefined
+  /** Omit the profile's user layer and --patch overlays; print bundle layers only. */
   defaultOnly: boolean
+  patches: string[]
+}
+
+/** Print declared plugin schemas without mounting the profile. */
+interface DumpConfigSchemaInvocation {
+  mode: 'dump-config-schema'
+  profile: string
+  /** Shipped template used once to initialize a missing profile. */
+  fromDefaultProfile?: string | undefined
   patches: string[]
 }
 
@@ -47,18 +59,20 @@ interface DumpConfigInvocation {
 interface PluginInvocation {
   mode: 'plugin'
   profile: string
+  /** Raw pnpm arguments, verbatim. */
   args: string[]
 }
 
-export type DshInvocation = ProfileInvocation | DumpConfigInvocation | PluginInvocation
+export type DshInvocation = ProfileInvocation | DumpConfigInvocation | DumpConfigSchemaInvocation | PluginInvocation
 ```
 
-（`fromDefaultProfile` 是仓库在课程写作之后新加的字段，配合下面会讲到的 `--from-default-profile` 选项——先记住它的存在，具体作用见"创建一个新 Profile"一节。）
+（`fromDefaultProfile` 是仓库在课程写作之后新加的字段，配合下面会讲到的 `--from-default-profile` 选项——先记住它的存在，具体作用见"创建一个新 Profile"一节；`DumpConfigSchemaInvocation` 则是 0.1.7 新增的第四个模式。）
 
-三种模式分别是：
+四种模式分别是：
 
 - **`profile`**：真正启动一个 Profile（`dsh --profile web`、`dsh --profile headless "task"`）；
 - **`dump-config`**：不启动任何进程，只把 Profile 装配出的插件树按补丁层打印出来；
+- **`dump-config-schema`**：不启动、也不挂载任何插件，只把组合树里各插件声明的配置 Schema 导出成一份 JSON Schema 文档（详见下面专属一节）；
 - **`plugin`**：管理某个 Profile 目录下的插件依赖（本质是把参数转发给 pnpm，在 Profile 目录里执行 `pnpm add`/`remove`/`why`）。
 
 命令行解析上有一条很重要的边界规则，写在模块顶部的注释里：
@@ -101,6 +115,7 @@ program
   .option('--from-default-profile <name>', 'initialize a new custom profile from a shipped profile template')
   .option('--patch <path>', 'extra patch-list overlay applied after the profile layer (repeatable)', collect)
   .option('--dump-config', 'print the composed profile tree and exit')
+  .option('--dump-config-schema', 'print JSON Schema for profile entries and patches without mounting')
   .option('--dump-default-config', 'print the profile tree without its user layer or --patch overlays and exit')
   .action((args: string[], options: BootOptions & { profile?: string }) => {
     if (options.profile === undefined) {
@@ -166,27 +181,31 @@ if (first === 'plugin') {
 
 `plugin` 子命令现在也只在需要时（`first === 'plugin'`）才注册，而不是无条件挂在 `program` 上——这是一个很小但值得注意的细节：不相关的调用路径不会承担注册一个从不会用到的子命令的开销。
 
-### `--dump-config` 与 `--dump-default-config`：两种"打印而不启动"
+### `--dump-config`、`--dump-config-schema` 与 `--dump-default-config`：三种"打印而不启动"
 
-`dump-config` 模式在同一个 `resolveBoot` 函数里判定：
+两种 dump 模式在同一个 `resolveBoot` 函数里判定（三个 dump flag 两两互斥）：
 
 ```typescript
-// apps/cli/src/args.ts（节选，当前版本比早期多了 --from-default-profile 的两处校验/透传）
+// apps/cli/src/args.ts（节选，当前版本比早期多了 --from-default-profile 的两处校验/透传，以及 --dump-config-schema 分支）
 function resolveBoot(program: Command, profile: string, options: BootOptions, args: string[]): DshInvocation {
   const patches = options.patch ?? []
   if (patches.includes('')) program.error('error: --patch needs a path')
   if (options.fromDefaultProfile === '') program.error('error: --from-default-profile needs a name')
-  if (options.dumpConfig !== true && options.dumpDefaultConfig !== true) {
+  const dumps = [options.dumpConfig, options.dumpDefaultConfig, options.dumpConfigSchema].filter(Boolean)
+  if (dumps.length === 0) {
     return { mode: 'profile', profile, fromDefaultProfile: options.fromDefaultProfile, patches, args }
   }
-  if (options.dumpConfig === true && options.dumpDefaultConfig === true) {
-    program.error('error: --dump-config and --dump-default-config are mutually exclusive')
+  if (dumps.length > 1) {
+    program.error('error: --dump-config, --dump-default-config, and --dump-config-schema are mutually exclusive')
   }
   // The dump is boot-free: it never runs app command-line providers, so it
   // cannot show what those flags would decide, and printing a tree that differs
   // from the same invocation's boot would mislead.
   if (args.length > 0) {
     program.error(`error: config dumps take no app arguments, got ${args.map(argument => JSON.stringify(argument)).join(' ')}`)
+  }
+  if (options.dumpConfigSchema === true) {
+    return { mode: 'dump-config-schema', profile, fromDefaultProfile: options.fromDefaultProfile, patches }
   }
   const defaultOnly = options.dumpDefaultConfig === true
   if (defaultOnly && patches.length > 0) {
@@ -196,12 +215,12 @@ function resolveBoot(program: Command, profile: string, options: BootOptions, ar
 }
 ```
 
-两者的区别在于是否包含用户自己的覆盖层：`--dump-config` 打印"这次真实启动会装配出的完整树"（Bundle 层 + Profile 的 `cordis.patch.yml` + Home 级用户层 + `--patch` 覆盖），`--dump-default-config` 只打印"Bundle 自带的默认层"，跳过用户的任何自定义。代码里那句注释解释了为什么 dump 模式干脆拒绝任何 app 参数：因为 dump 从不真正启动被装配的应用，如果允许传参却不生效，打印出的树就会和真实启动的结果不一致，反而误导排查问题的人。
+`--dump-config` 与 `--dump-default-config` 的区别在于是否包含用户自己的覆盖层：`--dump-config` 打印"这次真实启动会装配出的完整树"（Bundle 层 + Profile 的 `cordis.patch.yml` + Home 级用户层 + `--patch` 覆盖），`--dump-default-config` 只打印"Bundle 自带的默认层"，跳过用户的任何自定义。代码里那句注释解释了为什么 dump 模式干脆拒绝任何 app 参数：因为 dump 从不真正启动被装配的应用，如果允许传参却不生效，打印出的树就会和真实启动的结果不一致，反而误导排查问题的人。
 
-真正执行打印的是 `dump-config.ts`：
+真正执行打印的是 `dump-config.ts`（当前版本把"按层收集"这一步抽成了 `collectConfigDumpLayers`，因为下面要讲的 schema dump 也复用它）：
 
 ```typescript
-// apps/cli/src/dump-config.ts
+// apps/cli/src/dump-config.ts（节选）
 export function runDumpConfig(
   profile: string,
   defaultOnly: boolean,
@@ -209,6 +228,16 @@ export function runDumpConfig(
   fromDefaultProfile?: string,
 ): void {
   const loaded = prepareProfile(profile, !defaultOnly, fromDefaultProfile)
+  const layers = collectConfigDumpLayers(loaded, defaultOnly, patches)
+  // The dump anchors on the same empty root file the boot includes.
+  process.stdout.write(renderConfigDump(NAME, join(loaded.dir, PROFILE_ROOT_FILENAME), layers))
+}
+
+export function collectConfigDumpLayers(
+  loaded: Profile,
+  defaultOnly: boolean,
+  patches: readonly string[],
+): ConfigDumpLayer[] {
   const layers: ConfigDumpLayer[] = loaded.layers.map(layer => ({
     label: layer.packageName,
     patches: layer.patches,
@@ -227,11 +256,26 @@ export function runDumpConfig(
       layers.push({ label: absolute, patches: loadOverlayPatches(NAME, absolute) })
     }
   }
-  process.stdout.write(renderConfigDump(NAME, join(loaded.dir, PROFILE_ROOT_FILENAME), layers))
+  return layers
 }
 ```
 
 这个命令的价值在于：当一个插件行为不符合预期时（比如某个工具没被启用、某个配置项的值不是你以为的那样），第一反应不该是去猜测装配顺序,而是先跑一遍 `dsh --profile <name> --dump-config`，把每一层补丁（哪个 Bundle 贡献了哪一行、Profile 自己覆盖了什么、`--patch` 又覆盖了什么）按顺序打印出来直接看——这条命令完全不启动进程,也不会评估任何 `!!js` 表达式，是纯静态的补丁列表展开。
+
+### 新增能力：`--dump-config-schema`，把"这棵树能接受什么配置"导出成 JSON Schema
+
+0.1.7 新增了第四个模式（上游 PR #4705）：`--dump-config-schema`。它和 `--dump-config` 共享同一套补丁层（Bundle 层 + Profile 层 + Home 层 + `--patch`，也支持 `--from-default-profile`），但输出的不是补丁列表，而是一份 pretty-print 的 **JSON Schema 2020-12** 文档：根节点描述 `--dump-config` 打印的那份解析后条目列表，`$defs.patchList` 单独描述 Profile/Home/命令行覆盖层。入口是 `apps/cli/src/dump-config-schema.ts`：
+
+```typescript
+// apps/cli/src/dump-config-schema.ts
+/**
+ * Schema-dump entry: inspect the composed profile without applying its plugins.
+ * Imports and lazy schema builders execute trusted module code.
+ * @module @deepseek-ai/dsh/dump-config-schema
+ */
+```
+
+注意模块注释里这句 "Imports and lazy schema builders execute trusted module code"——这是它和 `--dump-config` 最关键的区别：`--dump-config` 是纯静态的补丁展开，连插件代码都不 import；而 schema dump 要拿到每个插件的 `Config` schema，就必须 **import 这些插件模块**（会执行模块顶层代码和惰性 schema 构造器），只是不真正挂载（apply）它们、也不求值 `!!js` 表达式。所以上游在 `apps/cli/reference/README.md` 里专门写了安全提示：对不可信的第三方插件跑 `--dump-config-schema` 之前要意识到这一点；Schema 收集或投影不完整时进程会以 exit code 1 退出并把诊断写到 stderr。这个模式的典型用途是给编辑器/校验工具提供"这个 Profile 的 `cordis.patch.yml` 里每个字段该是什么形状"的机器可读依据——字段的默认值、描述、`secret`/`credential-ref`/`volatile` 等角色元数据会以 `x-cordis` 注解的形式出现在 Schema 里。
 
 ### Profile 的物理结构
 
@@ -245,10 +289,11 @@ export function runDumpConfig(
  * `dsh.profile` with its ordered `bundles` list) and a `cordis.patch.yml`
  * (the user's own patch layer, applied after every bundle layer). Bundles are
  * npm packages whose manifest declares
- * `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`; the tree is
- * composed by applying each bundle's patch list in `dsh.profile.bundles`
- * order over an empty entry list, then the profile's own patches, then any
- * launcher layers (`--patch` files and flag-derived patches).
+ * `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` (one file, or an
+ * ordered list of files); the tree is composed by applying each bundle's patch
+ * lists in `dsh.profile.bundles` order over an empty entry list, then the
+ * profile's own patches, then any launcher layers (`--patch` files and
+ * flag-derived patches).
  */
 ```
 
@@ -257,7 +302,26 @@ export function runDumpConfig(
 - `package.json`：里面的 `dsh.profile.bundles` 是一份**有序的包名列表**，决定按什么顺序叠加哪些 Bundle；
 - `cordis.patch.yml`：用户自己在这个 Profile 上追加的覆盖层，会在所有 Bundle 层之后应用。
 
-反过来，"Bundle"指的是任何在自己 `package.json` 里声明了 `dsh.bundle.patch` 字段的 npm 包，比如：
+反过来，"Bundle"指的是任何在自己 `package.json` 里声明了 `dsh.bundle.patch` 字段的 npm 包。注意上面的注释在 0.1.7 里多了一个括号补充：**`patch` 可以是单个文件，也可以是一个有序的文件列表**——`dsh-web-app` 就是第一个用到列表形态的官方 Bundle，它的声明是：
+
+```json
+// packages/bundle/web-app/package.json（节选）
+"dsh": {
+  "bundle": {
+    "patch": [
+      "./cordis.patch.yml",
+      "./presets/standard.patch.yml",
+      "./presets/ptc.patch.yml",
+      "./presets/minimal.patch.yml",
+      "./presets/cordis.patch.yml"
+    ]
+  }
+}
+```
+
+后面这四个 `presets/*.patch.yml` 正是 0.1.7 另一条新能力的落地（上游 PR #4569）：**Agent 组合（preset）现在可以直接用普通的 Cordis YAML 在补丁文件里声明**。以 `presets/standard.patch.yml` 为例，它插入一条 `@deepseek-ai/dsh-agent-preset` 行，`config.plugins` 就是这个 Agent 组合挂载的子插件清单（persona、tool-bash、tool-fs、plan-mode……）；`dsh-web-app` 的主补丁层里还有一行 `agent-preset-registry`（`config.default: standard`）声明默认启用哪个组合。用户在 Web UI 的 General 设置页可以看到并切换这些 Agent 组合，编辑器里的修改会以补丁形式写回 Profile 的 `cordis.patch.yml`。也就是说"一个 Agent 挂哪些工具、什么人格"从硬编码的装配逻辑变成了普通 YAML 数据——这是"Profile-Bundle-Preset"这条主线在快速上手阶段唯一需要先记住的事实，完整的 preset 机制第 03 章会展开。
+
+而单个文件的旧写法依然成立，比如：
 
 ```json
 // packages/bundle/headless/package.json（节选）
@@ -272,7 +336,7 @@ export function runDumpConfig(
 }
 ```
 
-`dsh` 内置了官方模板，写在同一个文件里（当前已经是三个，课程写作时只有 `web`/`headless` 两个,`acp` 是后来加的,对应第 06 章"对外协议 SDK、ACP 与生态兼容 Hooks"要讲的 ACP 协议接入,这里先不展开）：
+`dsh` 内置了官方模板，写在同一个文件里。课程写作时只有 `web`/`headless` 两个；当前版本已经有**五个**——`acp`、`sdk`、`sdk-minimal` 都是后来加的（`acp` 对应第 06 章"对外协议 SDK、ACP 与生态兼容 Hooks"要讲的 ACP 协议接入；`sdk`/`sdk-minimal` 对应 Python SDK 等把 `dsh` 当子进程驱动的场景，第 07 章展开。这里先不展开）：
 
 ```typescript
 // packages/boot/app-boot/src/profile.ts
@@ -291,6 +355,12 @@ export const PROFILE_TEMPLATES: Record<string, ProfileTemplate> = {
   },
   headless: {
     bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'],
+  },
+  sdk: {
+    bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-sdk-app'],
+  },
+  'sdk-minimal': {
+    bundles: ['@deepseek-ai/dsh-sdk-minimal'],
   },
 }
 ```
@@ -313,24 +383,25 @@ export const PROFILE_TEMPLATES: Record<string, ProfileTemplate> = {
 `apps/cli/src/profile-boot.ts` 是真正把这些补丁层拼起来的地方。`composeProfile` 函数把叠加顺序落成了代码：
 
 ```typescript
-// apps/cli/src/profile-boot.ts（节选，签名比早期版本多了几个和"插件依赖解析模式""从模板新建 Profile"相关的参数）
+// apps/cli/src/profile-boot.ts（节选，签名比早期版本多了"从模板新建 Profile"和"应用自带的 Profile 运行时"相关参数）
 async function composeProfile(
   name: string,
   patchFiles: readonly string[],
-  resolutionMode: ProfileResolutionMode,
   fromDefaultProfile?: string,
   resolvedProfile?: ResolvedProfileRuntime,
 ): Promise<ComposedProfile> {
   const profile = resolvedProfile?.profile ?? prepareProfile(name, true, fromDefaultProfile)
-  ...
+  if (resolvedProfile !== undefined) writeFileSync(join(profile.dir, PROFILE_ROOT_FILENAME), PROFILE_ROOT_CONFIG)
+  const resolutionOptions = { installAnchor: resolvedProfile?.installAnchor ?? INSTALL_ANCHOR, profile }
+  const resolution = await createRuntimeResolution(resolutionOptions)
   const overlays = patchFiles.flatMap(file => loadOverlayPatches(NAME, resolve(file)))
   return { profile, resolution, overlays }
 }
 ```
 
-新增的 `resolutionMode`/`resolvedProfile` 两个参数处理的是"这个 Profile 目录下的第三方插件依赖该用什么方式解析"（运行时查找、磁盘链接、还是两者都验证一遍），这属于插件安装与解析机制的细节，不是本篇"补丁怎么叠加"要讲的内容，这里跳过，只需要知道函数变成异步、多了这两个参数即可。真正和本篇相关的是 `fromDefaultProfile` 这个参数——它被原样转发给 `prepareProfile`，这正是"用一个新名字 + 一个官方模板，创建并启动一个全新 Profile"这条路径的入口，下一节展开讲。
+新增的两个参数处理的是两件事：`resolvedProfile`/`installAnchor` 供"应用自带 Profile 的运行时"（比如桌面壳用自己的 installation anchor 做包解析，同时保留 Harness home 补丁层）——这属于插件解析机制的细节，不是本篇"补丁怎么叠加"要讲的内容，只需要知道函数变成异步、多了这两个参数即可。真正和本篇相关的是 `fromDefaultProfile` 这个参数——它被原样转发给 `prepareProfile`，这正是"用一个新名字 + 一个官方模板，创建并启动一个全新 Profile"这条路径的入口，下一节展开讲。
 
-配合模块顶部注释里的完整叠加顺序说明（这段措辞比早期版本略有调整，但描述的仍然是同一套顺序）：
+配合 `composeProfile` 上方注释里的完整叠加顺序说明（这段措辞比早期版本略有调整，但描述的仍然是同一套顺序）：
 
 ```typescript
 // apps/cli/src/profile-boot.ts
@@ -356,7 +427,7 @@ async function composeProfile(
 
 ### 新增能力：`--from-default-profile`，从模板创建一个新 Profile
 
-早期版本里，一个自定义 Profile（比如 `tui`）第一次被用到时，只能靠 `dsh plugin --profile tui add <package>` 隐式初始化一个空目录（前面"`plugin` 模式"一节的注释里也写着"initialized on first use"）。当前仓库新增了一条更直接的路径：`--from-default-profile <name>`，可以显式指定"照抄哪个官方模板的 Bundle 列表来新建"。落地实现在 `initializeProfileFromDefault`：
+早期版本里，一个自定义 Profile（比如 `tui`）第一次被用到时，只能靠 `dsh plugin --profile tui add <package>` 隐式初始化（当前版本这条路径初始化出来的是一个只挂 `dsh-base` 的 Profile——`profile.ts` 里的 `DEFAULT_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base']`；前面"`plugin` 模式"一节的注释里也写着"initialized on first use"）。当前仓库新增了一条更直接的路径：`--from-default-profile <name>`，可以显式指定"照抄哪个官方模板的 Bundle 列表来新建"。落地实现在 `initializeProfileFromDefault`：
 
 ```typescript
 // apps/cli/src/profile-boot.ts
@@ -398,38 +469,43 @@ dsh rescue --from-default-profile web
                                           create rescue from the shipped web template, then boot it
 ```
 
-也就是说 `dsh rescue --from-default-profile web` 会新建一个叫 `rescue` 的 Profile，Bundle 列表直接照抄 `web` 模板（`dsh-base` + `dsh-web-app`），然后立刻启动它——新 Profile 一旦建好，后续再运行 `dsh rescue`（不带 `--from-default-profile`）就是普通的启动，模板名字只在"这个 Profile 目录还不存在"的那一次调用里生效。函数注释里"local state from the same-named shipped profile is not read"这句话值得注意：如果你恰好把新 Profile 取名叫 `web` 本身，这条路径也会拒绝——`web`/`headless`/`acp` 这几个官方模板名字本身是保留字，不能被当成自定义 Profile 的目标名字（对应上面代码里的第二个 `throw`）。这条新命令解决的是一个具体的实际痛点：以前想要"一个基本等同于官方 web Profile，但自己加了几个额外插件"的自定义配置，得手动照抄 `PROFILE_TEMPLATES` 里的 Bundle 列表去写 `package.json`；现在一条命令就能从模板起步，再叠加自己的 `cordis.patch.yml`。
+也就是说 `dsh rescue --from-default-profile web` 会新建一个叫 `rescue` 的 Profile，Bundle 列表直接照抄 `web` 模板（`dsh-base` + `dsh-web-app`），然后立刻启动它——新 Profile 一旦建好，后续再运行 `dsh rescue`（不带 `--from-default-profile`）就是普通的启动，模板名字只在"这个 Profile 目录还不存在"的那一次调用里生效。函数注释里"local state from the same-named shipped profile is not read"这句话值得注意：如果你恰好把新 Profile 取名叫 `web` 本身，这条路径也会拒绝——`web`/`headless`/`acp`/`sdk`/`sdk-minimal` 这几个官方模板名字本身是保留字，不能被当成自定义 Profile 的目标名字（对应上面代码里的第二个 `throw`）。这条新命令解决的是一个具体的实际痛点：以前想要"一个基本等同于官方 web Profile，但自己加了几个额外插件"的自定义配置，得手动照抄 `PROFILE_TEMPLATES` 里的 Bundle 列表去写 `package.json`；现在一条命令就能从模板起步，再叠加自己的 `cordis.patch.yml`。
 
 ### 跑一次无人值守任务：`dsh --profile headless`
 
-`dsh-headless` 这个 Bundle 的补丁层展示了一个"一次性任务驱动器"最小需要挂载哪些插件：
+`dsh-headless` 这个 Bundle 的补丁层展示了一个"一次性任务驱动器"最小需要挂载哪些插件（当前版本相比课程写作时有几处变化：`system-prompt` 的人格配置拆成了 `personaPrefix`/`personaSuffix` 两个字段；早期存在的 `code-runtime` 行已被移除；`headless-runner` 的 config 多了 `sessionId` 和 `json` 两个透传项）：
 
 ```yaml
 # packages/bundle/headless/cordis.patch.yml
 - id: system-prompt
   config:
-    persona: >-
-      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+    personaSuffix: Your working directory is {{cwd}}.
+    personaPrefix: >-
+      You are a coding agent powered by the {{model}} model.
 
-- id: hmr
-  disabled: true
+- id: tools
+  config:
+    # Keep the same temporary process-wide PTC mode opt-in as the Web surface.
+    mode: !!js process.env.DSH_TOOLS_MODE
 
 - insert:
-    - id: code-runtime
-      name: '@deepseek-ai/dsh-code-runtime-worker-thread'
-
     - id: headless-startup
       name: '@deepseek-ai/dsh-headless/startup'
 
-    # Reads its task from the ordinary headlessStartup provider.
+    # Reads its task and run options from the ordinary headlessStartup provider.
     - id: headless-runner
       name: '@deepseek-ai/dsh-headless'
       inject: [headlessStartup]
       config:
         task: !!js ctx.headlessStartup.task
+        sessionId: !!js ctx.headlessStartup.sessionId
+        json: !!js ctx.headlessStartup.json
+
+- id: hmr
+  disabled: true
 ```
 
-这里的模式和上一篇讲的 `web-startup` 一模一样：`headless-startup` 是一个普通插件,负责解析命令行里的任务字符串（`dsh --profile headless "summarize this workspace"` 里引号内的那段文本）并把它作为 `headlessStartup` 服务发布出去；`headless-runner` 声明 `inject: [headlessStartup]`，等这个服务可用之后再用 `!!js ctx.headlessStartup.task` 把任务文本注入自己的 `config.task`。跑起来的命令形如：
+这里的模式和上一篇讲的 `web-startup` 一模一样：`headless-startup` 是一个普通插件,负责解析命令行里的任务字符串（`dsh --profile headless "summarize this workspace"` 里引号内的那段文本）、`--session-id`（精确接续某个已存在的会话）和 `--json`（结构化输出）这两个选项，并把它们作为 `headlessStartup` 服务发布出去；`headless-runner` 声明 `inject: [headlessStartup]`，等这个服务可用之后再用 `!!js ctx.headlessStartup.task`（以及 `sessionId`/`json`）把任务文本和运行选项注入自己的 config。跑起来的命令形如：
 
 ```sh
 pnpm dsh --profile headless "summarize this workspace"
@@ -483,9 +559,9 @@ dsh plugin --profile tui add some-third-party-plugin
 - **以为 `--dump-config` 会执行 `!!js` 表达式**：不会，`dump-config` 是纯静态的补丁列表展开，从不装配、也不启动树，所以看不到 `!!js` 表达式求值后的最终值，只能看到表达式本身和它所在的补丁层。
 - **`dsh --profile headless` 卡住不退出**：确认 `DEEPSEEK_API_KEY` 是否可用——没有可用的凭证时模型调用会失败，而不是直接报错退出；参见第 01 篇的凭证优先级说明。
 - **给 Profile 装完插件依赖后没生效**：`dsh plugin add` 只负责 pnpm 依赖安装，真正把新插件接入装配树需要手动编辑该 Profile 的 `cordis.patch.yml`。
-- **想创建一个自定义 Profile，但 `dsh myprofile` 直接报"Profile 不存在"**：自定义 Profile 第一次启动前必须先有内容——要么用 `dsh plugin --profile myprofile add <package>` 装至少一个插件，要么用 `dsh myprofile --from-default-profile web`（或 `headless`/`acp`）从官方模板起步；裸启动一个从未初始化过的自定义名字不会自动生成任何内容。
-- **`--from-default-profile` 传了一个不认识的名字**：会直接抛错并在错误信息里列出当前所有合法模板名（目前是 `acp`/`headless`/`web`，按字母序），照着这份列表选一个即可，不需要去翻源码确认。
+- **想创建一个自定义 Profile，但 `dsh myprofile` 直接报"Profile 不存在"**：自定义 Profile 第一次启动前必须先初始化——要么用 `dsh plugin --profile myprofile add <package>`（这条路径会自动初始化一个只挂 `dsh-base` 的 Profile 再装插件），要么用 `dsh myprofile --from-default-profile web`（或 `headless`/`acp`/`sdk`/`sdk-minimal`）从官方模板起步；裸启动一个从未初始化过的自定义名字不会自动生成任何内容。
+- **`--from-default-profile` 传了一个不认识的名字**：会直接抛错并在错误信息里列出当前所有合法模板名（目前是 `acp`/`headless`/`sdk`/`sdk-minimal`/`web`，按字母序），照着这份列表选一个即可，不需要去翻源码确认。
 
 ## 小结
 
-`dsh` 的命令行本质上是一层很薄的分发器：`profile` 模式启动装配好的插件树，`dump-config` 模式只打印装配结果不启动，`plugin` 模式管理某个 Profile 的第三方依赖。Profile 本身是"若干 Bundle 补丁层 + Home 级用户层 + 命令行覆盖层"按固定顺序叠加的结果；`web`/`headless`/`acp` 是三个内置模板，本质上没有任何特权，`--from-default-profile` 让任何人都能从这几个模板起步拼出自己的 Profile。命令行解析本身也从"只有 `web` 硬编码成子命令"演化成了"任意 Profile 名字都能作为 `dsh <name>` 的通用简写"这套更一致的规则。下一篇会深入其中一层最关键的补丁——Provider 与模型配置，看 `dsh` 如何用同一套 Seam 机制同时支持 DeepSeek 官方 API 和其他厂商的模型。
+`dsh` 的命令行本质上是一层很薄的分发器：`profile` 模式启动装配好的插件树，`dump-config`/`dump-config-schema` 两个模式只打印装配结果（补丁层列表 / 配置 JSON Schema）不启动，`plugin` 模式管理某个 Profile 的第三方依赖。Profile 本身是"若干 Bundle 补丁层 + Home 级用户层 + 命令行覆盖层"按固定顺序叠加的结果；`web`/`headless`/`acp`/`sdk`/`sdk-minimal` 是五个内置模板，本质上没有任何特权，`--from-default-profile` 让任何人都能从这几个模板起步拼出自己的 Profile。命令行解析本身也从"只有 `web` 硬编码成子命令"演化成了"任意 Profile 名字都能作为 `dsh <name>` 的通用简写"这套更一致的规则。下一篇会深入其中一层最关键的补丁——Provider 与模型配置，看 `dsh` 如何用同一套 Seam 机制同时支持 DeepSeek 官方 API 和其他厂商的模型。

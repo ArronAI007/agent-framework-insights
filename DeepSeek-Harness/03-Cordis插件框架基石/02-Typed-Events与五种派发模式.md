@@ -1,4 +1,4 @@
-# Typed Events：四种派发模式与 waterfall 语义
+# Typed Events：五种派发模式与 waterfall 语义
 
 > 服务方法调用要求调用方"认识"这个服务；而 dsh 里大量的拦截点——要不要放行一次工具调用、要不要重写这一步喂给模型的消息、请求失败了要不要重试——都需要"完全不认识对方、甚至不知道对方存不存在"的插件之间协作。Cordis 的 Typed Events 就是为这类协作设计的，而 `emit`、`parallel`、`serial`、`bail`、`waterfall` 五种派发模式的区别，本质上都是在回答同一个问题：多个监听器之间，谁等谁、谁能改谁的结果、谁能一票否决。
 
@@ -26,7 +26,7 @@ Cordis 的答案是**事件**：工具注册表只负责在关键时刻广播一
 
 ### 五种派发模式的语义对照
 
-`docs/cordis-primer.md` 用一张表概括了四种主要模式（`bail` 是 `serial` 的同步版本，`docs/cordis-tutorial/04-events.md` 里补全为五种）：
+`docs/cordis-primer.md` 用一张表概括了五种模式的语义，`docs/cordis-tutorial/04-events.md` 里给出同样的对照并补充了每种的调用方法：
 
 | Mode | Awaited? | Dispatch Order | Has Return Value? |
 |---|---|---|---|
@@ -34,6 +34,7 @@ Cordis 的答案是**事件**：工具注册表只负责在关键时刻广播一
 | `waterfall` | No（自身同步返回，但监听器可以是 async） | listeners observe in registration order | Yes |
 | `parallel` | Yes | all listeners observe the event in parallel | No |
 | `serial` | Yes | listeners observe in registration order | Yes |
+| `bail` | No | listeners observe in registration order until one bails | Yes |
 
 对应的调用方法签名，来自 `docs/cordis-api/events.md`（源码 `vendor/cordis/src/events.ts`）：
 
@@ -98,6 +99,7 @@ interface Events {
      * @param payload.turn - the turn that will own the step.
      * @param payload.step - the step proposed by the loop.
      * @param payload.signal - the current turn's cancellation signal.
+     * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
      * @mode waterfall
      */
     'agent/pre-step'(
@@ -108,7 +110,7 @@ interface Events {
 }
 ```
 
-这条 `@mode waterfall` 标签不是纯文档装饰——`docs/cordis-primer.md` 提到"生成的目录会核对声明和实际派发点是否一致"（"the generated catalog can check declarations against dispatch sites"），也就是说文档和代码之间有一条自动校验的链路，防止文档漂移。
+这条 `@mode waterfall` 标签不是纯文档装饰——`docs/cordis-primer.md` 提到"生成的目录会核对声明和实际派发点是否一致"（"the generated catalog can check declarations against dispatch sites"），也就是说文档和代码之间有一条自动校验的链路，防止文档漂移。`Scope-filtered dispatch` 那一行则标注了另一件事：这个事件的派发会经过 `@deepseek-ai/dsh-scope` 的作用域过滤——挂在某个 Agent 作用域里的监听器只会收到属于那个 Agent 的事件，别的 Agent 走的同一事件名它完全看不到。`dsh-scope` 是一个不依赖 Agent 循环的独立作用域注册库（子作用域继承祖先的贡献、祖先能观察后代的活动，反向都不行；销毁作用域即回收它名下的一切），第三篇的"注册即副作用"和第四篇的 Preset 隔离都建立在它提供的这套作用域语义之上。
 
 ### waterfall 深入：环绕式中间件与 `next()`
 
@@ -170,6 +172,8 @@ HELLO
 ```ts
 // packages/core/agent-loop/src/agent.ts
 private async preStep(target: InboxTarget, position: { turn: number; step: number }): Promise<PreparedStep> {
+  /* v8 ignore next -- private callers establish the running phase before proposing a step */
+  if (this.phase.kind !== 'running') throw new Error(`agent "${this.id}": pre-step outside running phase`)
   const signal = this.phase.abort.signal
   const claimed = this.inbox.claim(target, position.turn)
   const assembly = await this.loopCtx.systemPrompt.assemble(assembleContextFor(this, signal))
@@ -184,7 +188,8 @@ private async preStep(target: InboxTarget, position: { turn: number; step: numbe
     }),
   )
   signal.throwIfAborted()
-  return decision.kind === 'reject' ? decision : { ...decision, assembly }
+  if (decision.kind === 'reject') return decision
+  return { ...decision, assembly }
 }
 ```
 
@@ -198,10 +203,10 @@ const NativeGuard = {
   name: 'native-guard',
   apply(ctx: Context) {
     // 1. SessionStart: seed a standing instruction.
-    ctx.on('agent/session-start', ({ agent, source }) => {
+    ctx.on('agent/created', ({ agent, source }) => {
       agent.inject(createUserMessage({
         content: [{ type: 'text', text: `policy active (started: ${source})` }],
-        source: { kind: 'plugin', plugin: 'native-guard' },
+        source: { kind: 'native-guard' },
       }))
     })
     // 2. PreStep: reject a forbidden prompt, annotate the rest.
@@ -234,16 +239,20 @@ const NativeGuard = {
 // packages/core/tools/src/index.ts
 interface Events {
   /**
-   * Allow, deny, or ask before dispatch. `next()` delegates to allow; missing
+   * Allow, deny, cancel, or ask before dispatch. `next()` delegates to allow;
+   * `cancel` selects the canonical pre-dispatch cancellation result, and missing
    * approval support turns `ask` into denial. Async gates must observe
    * `exec.signal`; the registry rechecks cancellation after they settle but
    * never abandons their promise.
+   * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent's calls.
    * @param exec - the pending call (name, parsed arguments, caller agent).
    * @mode waterfall
    */
   'tools/pre-execute'(this: Scoped<ToolRuntime>, exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision>
 }
 ```
+
+监听器返回的 `PreToolDecision` 是一个四选一的可辨识联合（`packages/core/tools/src/index.ts`）：`allow`（放行）、`deny`（带理由拒绝，模型会看到一条 `isError` 的工具结果）、`cancel`（进入"规范的派发前取消"结果路径，用于把取消语义和拒绝区分开）、`ask`（升级为向用户请求批准，宿主不支持审批时按 `deny` 处理）。
 
 `packages/core/agent-loop/tests/interception.spec.ts` 里一个更完整的端到端测试展示了它在真实调用链路里的效果——注册一个"危险工具"，再挂一个监听器拒绝它，断言模型最终看到的是一条 `isError: true` 的工具结果，而不是工具真的被执行了：
 
@@ -258,7 +267,7 @@ describe('tools/pre-execute gate (native-plugin permission pattern, end-to-end t
       name: 'danger', description: 'danger', parameters: {},
       async execute() { ran = true; return [{ type: 'text', text: 'should not run' }] },
     }))
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
     ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
       if (exec.name === 'danger') return { kind: 'deny', reason: 'blocked dangerous tool' }
@@ -270,7 +279,9 @@ describe('tools/pre-execute gate (native-plugin permission pattern, end-to-end t
 
     expect(ran).toBe(false)
     const result = events(agent).find(e => e.type === 'tool/result')
-    expect(result?.type === 'tool/result' && result.data.message.content[0].isError).toBe(true)
+    expect(result?.type === 'tool/result' && result.data.message.isError).toBe(true)
+    expect(result?.type === 'tool/result'
+      && result.data.message.content.some(b => b.type === 'text' && b.text.includes('blocked dangerous tool'))).toBe(true)
   })
 })
 ```

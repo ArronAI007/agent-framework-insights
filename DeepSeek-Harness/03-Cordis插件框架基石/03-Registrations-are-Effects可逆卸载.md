@@ -187,7 +187,26 @@ register(definition: ToolDefinition): () => void {
 }
 ```
 
-`this.layers.effect(this.ctx, ...)` 是 `dsh-tools` 内部对 `ctx.effect()` 的一层封装（附带一个 `label`，用于诊断），但本质就是把"往内部层级结构里插入一条工具定义"包成一个 effect，绑定在调用 `register()` 时的当前 Fiber 上。这也解释了第一篇 `session-stats` 插件里那句注释的准确含义：
+`this.layers.effect(this.ctx, ...)` 是 `dsh-tools` 内部对 `ctx.effect()` 的一层封装（附带一个 `label`，用于诊断），但本质就是把"往内部层级结构里插入一条工具定义"包成一个 effect，绑定在调用 `register()` 时的当前 Fiber 上。第一篇里出现的另一个注册表——命令注册表 `ctx.commands`——走的是同一套封装（`packages/interaction/commands/src/index.ts`）：
+
+```ts
+// packages/interaction/commands/src/index.ts
+/**
+ * Register a global or calling-agent-scoped command.
+ * @param definition - discovery metadata and direct UI handler.
+ * @returns the exact effect disposer that unregisters this definition.
+ */
+register(definition: CommandDefinition): () => void {
+  const registered = normalizeDefinition(definition)
+  return this.layers.effect(
+    this.ctx,
+    layer => layer.commands.insert(registered.definition.name, registered),
+    { label: 'commands.register()' },
+  )
+}
+```
+
+这也解释了第一篇 `session-stats` 插件里那句注释的准确含义：
 
 > the registration is an effect on this plugin's fiber, so unloading removes the key
 

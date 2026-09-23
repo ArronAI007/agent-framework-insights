@@ -17,7 +17,7 @@ DeepSeek Harness（`dsh`）是 DeepSeek AI 开源的一个 **agent harness（智
 课程延续"**先会用，再懂原理，最后能扩展**"的主线，但因为 dsh 的核心是一套插件框架，比 `pi` 多了一层"框架基石"必须单独讲清楚，否则后面所有"能力扩展"都无法理解。全课程分为六条主线：
 
 1. **快速上手**（第 01 章）：环境准备、CLI 与 Web UI、Profile 机制、Provider 配置、权限预设——让你在最短时间内把 `dsh` 跑起来，并对它的运行形态有直觉认识。
-2. **仓库全景与工程实践**（第 02 章）：229 个叶子包的 monorepo 地图、Host/Client 双面构建体系、分层测试与 CI 门禁、vendoring 治理——建立理解后续所有章节所需的工程地图。
+2. **仓库全景与工程实践**（第 02 章）：307 个叶子包的 monorepo 地图、Host/Client 双面构建体系、分层测试与 CI 门禁、vendoring 治理——建立理解后续所有章节所需的工程地图。
 3. **Cordis 插件框架基石**（第 03 章）：Context / Service / Plugin / Typed Events 四个核心概念，以及 Profile-Bundle-Preset 装配机制。**这是本课程和 PI 课程最大的不同之处**：不理解 Cordis，后面讲的"能力 Seam""可逆注册"都无从谈起。
 4. **Agent 核心循环**（第 04 章）：`ReactLoopAgent` 的 `kick → turn → step` 驱动模型、会话事件溯源、流式输出管道、上下文压缩与 Checkpoint 持久化、错误重试与取消——这是引擎的心脏。
 5. **能力扩展范式与跨语言边界**（第 05～07 章）：Capability Seam 三元结构、工具注册与执行管线、权限审批与多沙箱后端、内置工具全解析、Native 沙箱内核与 Python SDK 桥接、Host/Client RPC 生成、子代理与工作流引擎——这是本课程篇幅最大的部分，逐一拆开 dsh"插件化能力"的具体案例。
@@ -40,7 +40,7 @@ DeepSeek Harness（`dsh`）是 DeepSeek AI 开源的一个 **agent harness（智
 ## 学习方式建议
 
 - 每篇文章涉及源码解读的地方都会标注具体文件路径（如 `packages/core/agent-loop/src/agent.ts`），建议对照本地克隆的仓库边读边操作，收获会比只读课程文字大得多；
-- 仓库体量很大（`packages/` 下约 49 个分类目录、219 个可发布叶子包），不需要通读全部代码——课程会明确指出每一章"值得精读"的最小文件集合；
+- 仓库体量很大（`packages/` 下约 54 个分类目录、307 个叶子包），不需要通读全部代码——课程会明确指出每一章"值得精读"的最小文件集合；
 - 官方文档本身质量很高且和源码保持同步（`docs/architecture.md`、`docs/cordis-primer.md`、`docs/tool-catalog.md` 等大量文档由脚本从源码生成），课程会在合适的地方直接引用，而不是重复劳动；
 - 课程各章相对独立，如果你已经会安装使用 `dsh`，可以直接从第 02 章或第 03 章开始；如果你只关心"如何加一个新工具/新沙箱"，可以直接跳到第 05～06 章。
 

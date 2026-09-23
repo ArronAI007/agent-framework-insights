@@ -21,14 +21,14 @@
 一次模型调用的完整参数由 `GenerateOptions` 描述，它不认识任何具体厂商的字段名：
 
 ```typescript
-// packages/llm/llm/src/types.ts
+// packages/llm/llm/src/types.ts（节选，字段上的 JSDoc 从略）
 export interface GenerateOptions {
   /** Registered provider route selecting the adapter instance. */
   provider: string
   model: string
   /** Adapter-owned reasoning effort selected for this exact model. */
   reasoningEffort?: ReasoningEffortId
-  messages: Message[]
+  messages: RequestMessage[]
   system?: string
   tools?: ToolSchema[]
   temperature?: number
@@ -48,10 +48,15 @@ export type StreamChunk =
   | { type: 'block-start'; index: number; blockType: ContentBlockType }
   | { type: 'text-delta'; index: number; text: string }
   | { type: 'reasoning-delta'; index: number; text: string }
-  | { type: 'tool-call-delta'; index: number; id: CallId; name?: string; argumentsDelta: string }
+  | { type: 'tool-call-delta'; index: number; id: ToolCallId; name?: string; argumentsDelta: string }
   | { type: 'block-end'; index: number; block: ContentBlock }
   | { type: 'usage'; usage: TokenUsage }
-  | { type: 'finish'; reason: FinishReason; replayState?: unknown }
+  | {
+    type: 'finish'
+    reason: FinishReason
+    /** Replay metadata for a successful response; see {@link ReplayEnvelope}. */
+    replayState?: ReplayEnvelope
+  }
 ```
 
 模块顶部注释点明了这份词汇表的设计取舍：
@@ -117,49 +122,59 @@ function requestProposal(header: EpochHeader): LlmCallConfig {
 
 ### `llm-deepseek`：DeepSeek 官方适配器怎么组装一次连接
 
-`llm-deepseek` 这个插件的模块注释一句话概括了它的职责：
+`llm-deepseek` 这个插件在 0.1.7 里做过一次文件拆分：插件入口 `index.ts` 只留了一行模块注释（"Register DeepSeek Messages with live configuration and request-local credentials."），真正的配置词汇表和解析逻辑搬到了同目录的 `config.ts`。后者的 `Config` 接口上方注释概括了它的职责：
 
 ```typescript
-// packages/llm/llm-deepseek/src/index.ts
+// packages/llm/llm-deepseek/src/config.ts
 /**
- * Register a {@link DeepSeekAdapter} for the `deepseek-official` provider route on
- * `ctx.llm`, with connection facts resolved per request instead of frozen at
- * load: the plugin layers its `cordis.yml` entry config under the optional
- * `llm-deepseek` user-settings section (`ctx.settings`) and resolves the API
- * key through the optional credential seam (`ctx.credentials`), ...
+ * Plugin config, validated by the same-named schemastery schema and doubling
+ * as the `llm-deepseek` settings-section shape. Every field is optional in
+ * yml: a missing API key resolves through {@link Config.apiKeyEnv} at each
+ * request (a request without any key fails with `MISSING_CREDENTIAL`, not at
+ * plugin load), omitted thinking mode uses the provider default, and omitted
+ * reasoning effort resolves to `high`.
  */
 ```
 
-它的 `Config` 接口里，**没有任何字段直接是密钥本身**，只有一个"密钥引用名"：
+它依然是那个设计：连接事实（endpoint、Key）在**每次请求时**解析，而不是在插件加载时冻结。`Config` 接口里**没有任何字段直接是密钥本身**，只有一个"密钥引用名"。另一个 0.1.7 的变化是：所有字段都被声明为 `Volatile<...>`（Cordis 的"活配置引用"，配合后面讲到的 settings 机制可以热更新），并且字段数量比早期版本多了不少（图片/文件上传相关的一组限额字段，这里用省略号略去）：
 
 ```typescript
-// packages/llm/llm-deepseek/src/index.ts
+// packages/llm/llm-deepseek/src/config.ts（节选，省略了 image/file 相关的若干 Volatile 限额字段）
 export interface Config {
   /** Credential reference (environment-variable name) resolved per request; defaults to `DEEPSEEK_API_KEY`. */
-  apiKeyEnv?: string
+  apiKeyEnv: Volatile<string>
   /** Endpoint base; falls back to $DEEPSEEK_BASE_URL from a trusted environment layer, then the public API. */
-  baseURL?: string
-  thinking?: 'enabled' | 'disabled'
-  reasoningEffort?: 'off' | 'high' | 'max'
-  maxTokens?: number
-  defaultContextWindow?: number
-  models?: DeepSeekCatalogModel[]
-  streamIdleTimeoutMs?: number
-  retryPolicy?: RetryPolicyConfig
+  baseURL: Volatile<string | undefined>
+  /** Deployment thinking policy; `disabled` limits every conversation request to `off`. */
+  thinking: Volatile<'enabled' | 'disabled' | undefined>
+  /** Default thinking effort (default `high`); `off` disables thinking per request. */
+  reasoningEffort: Volatile<'off' | 'low' | 'high' | 'max' | undefined>
+  maxTokens: Volatile<number>
+  defaultContextWindow: Volatile<number>
+  models: Volatile<DeepSeekCatalogModel[]>
+  streamIdleTimeoutMs: Volatile<number>
+  ...
+  retryPolicy: Volatile<RetryPolicyConfig | undefined>
 }
 ```
 
-真正解析出连接参数的地方是 `resolveAdapterOptions`——注意它接收的是"配置"和"环境层"两个独立参数,而密钥的真正取值在这个函数之外的 `resolveApiKey` 才发生：
+（顺带一提：`reasoningEffort` 的字面量集合也扩了——早期版本只有 `'off' | 'high' | 'max'`，现在多了 `'low'`。）
+
+真正解析出连接参数的地方依然是 `resolveAdapterOptions`（在拆分后位于 `config.ts`）——注意它接收的是"配置"和"环境层"两个独立参数,而密钥的真正取值在这个函数之外的 `resolveApiKey` 才发生。插件入口用它组装解析器时，先用 `plainOptions(config)` 把 `Volatile` 引用读成普通值（每次读取都是当次解析，不是加载时冻结）：
 
 ```typescript
 // packages/llm/llm-deepseek/src/index.ts（节选）
-export function resolveAdapterOptions(config: Config, environment?: LaunchEnvironmentSnapshot): ResolvedDeepSeekOptions {
+const options = (): ResolvedDeepSeekOptions => resolveAdapterOptions(plainOptions(config), launchEnvironmentOf(ctx))
+```
+
+```typescript
+// packages/llm/llm-deepseek/src/config.ts（节选；0.1.7 版本在 return 之前先做了一整段逐字段校验，
+// protocol/baseURL/各类限额参数不合法会直接抛错，这里从略）
+export function resolveAdapterOptions(config: Options, environment?: LaunchEnvironmentSnapshot): ResolvedDeepSeekOptions {
   ...
   return {
     apiKeyEnv: credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV),
-    baseURL: config.baseURL
-      ?? environment?.get(BASE_URL_ENV)?.value
-      ?? PUBLIC_BASE_URL,
+    baseURL: config.baseURL ?? environment?.get(BASE_URL_ENV)?.value ?? PUBLIC_BASE_URL,
     defaults: {
       thinking: config.thinking,
       reasoningEffort: config.reasoningEffort,
@@ -169,6 +184,7 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
     models: resolveModels(config.models),
     streamIdleTimeoutMs,
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-deepseek: retryPolicy'),
+    ...
   }
 }
 ```
@@ -199,19 +215,18 @@ const resolveApiKey = async (connection: ResolvedDeepSeekOptions): Promise<strin
 
 这正是上一篇讲过的凭证优先级链条在具体消费者身上的落地：如果 `credentials` Seam 存在（正常安装下 `dsh-base` 会挂载 `credentials-local`），就走它的完整优先级解析；如果整个 Seam 都没挂载（一个极简的自定义 Profile），才退化成直接读取进程环境。**每次请求都重新解析一次**，而不是在插件加载时缓存下来——这就是为什么在 Web UI 的 Models 页面改一次 Key，下一次对话立刻生效，不需要重启进程。
 
-非敏感的偏好（`baseURL`、`thinking`、`reasoningEffort` 默认值、模型目录……）走的是另一条路——`installSettingsSection` 把插件自己声明的 `Config` schema 注册成一个用户设置命名空间：
+非敏感的偏好（`baseURL`、`thinking`、`reasoningEffort` 默认值、模型目录……）走的是另一条路。0.1.7 里 settings 机制换过一版实现：以前插件用 `installSettingsSection()` 把 schema 注册成一个独立命名空间，现在改为插件把字段声明为 **volatile**（`schemastery` 的 `.volatile()`，即"活配置引用"），Settings 服务直接按 entry id 暴露这些字段，Web UI 表单读写它们；写回的路径不再是独立命名空间，而是**持久化到当前 Profile 的 Cordis 补丁**里。`llm-deepseek` 因为自带设置页面，注册的是"关闭自动生成表单"的策略，并监听 Loader 的 volatile 更新事件：
 
 ```typescript
 // packages/llm/llm-deepseek/src/index.ts（节选）
-installSettingsSection(ctx, NS, Config, config, {
-  setSource: (source) => {
-    current = source
-  },
-  onChange: ensureRegistrationFacts,
-})
+export function apply(ctx: Context, config: Config): void {
+  ctx.inject(['settings'], (child) => { child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)) })
+  ...
+  ctx.on('loader/volatile-update', ensureRegistrationFacts)
+}
 ```
 
-`packages/settings/settings` 的 README 说明了这套 Seam 的读取顺序：**schema 默认值 → 该插件在 `cordis.yml` entry 里写的 `config`（作为 `base`）→ 用户在设置界面写的覆盖（`user` 层）**。也就是说同一个 `baseURL` 字段，`cordis.yml` 里可以写一个部署级默认，用户在 Web UI 的设置页面可以再覆盖一次，两者互不冲突,`ctx.settings` 会按这个顺序把它们合并成一份解析结果——这条链路和 `credentials` 的"继承环境 > 托管文件 > `.env`"优先级链条是两套完全独立的机制，一套管"这个值是多少"，一套管"这个密钥的真实内容是什么"。
+`packages/settings/settings` 的 README 说明了这套 Seam 的分层语义：**Reset 会恢复到 Profile 覆盖层之下的值（含 schema 默认值）；Home 补丁和命令行覆盖层优先级更高——一次表单写入如果会被它们覆盖，会被直接拒绝**。也就是说同一个 `baseURL` 字段，`cordis.yml`/Profile 补丁里写的部署级默认和用户在 Web UI 里改的覆盖可以共存,但 Home 层和 `--patch` 覆盖层永远压过 UI 表单——这条链路和 `credentials` 的"继承环境 > 托管文件 > `.env`"优先级链条仍然是两套完全独立的机制，一套管"这个值是多少"，一套管"这个密钥的真实内容是什么"。
 
 ### `llm-pi-ai`：验证同一套 Seam 能装下另一种适配器风格
 
@@ -250,14 +265,14 @@ installSettingsSection(ctx, NS, Config, config, {
 结合以上几点，实际配置模型的入口有三层，优先级从低到高：
 
 1. **Bundle 自带的默认层**：`dsh-base`/`dsh-web-app` 的 `cordis.patch.yml` 里 `llm-deepseek` 这一行的 `config`（部署默认，比如把 `models` 目录限定成公司内部批准的几个模型）；
-2. **用户设置（`ctx.settings`）**：Web UI 的 Models 设置页面写的覆盖，落在 `llm-deepseek` 命名空间的用户层；
+2. **用户设置（`ctx.settings`）**：Web UI 的 Models 设置页面写的覆盖，持久化为当前 Profile 的 Cordis 补丁（写进 Profile 的 `cordis.patch.yml`），不再是独立的 `llm-deepseek` 命名空间用户层；
 3. **凭证（`ctx.credentials`）**：只负责 `apiKeyEnv` 指向的那个引用名背后的真实密钥值，和上面两层完全独立。
 
 一次对话具体用哪个 `provider`/`model`/`reasoningEffort`，则记录在会话自己的 `EpochHeader` 里，由 `agent-loop` 在每个 turn 边界读取、比较、决定是否需要追加新的请求头快照——这部分完整的状态机属于 Agent 核心循环的范畴，第 04 章会继续深入。
 
 ## 常见问题/易踩坑
 
-- **改了 Web UI 的模型设置没生效**：先确认改的是不是 `cordis.yml`/Bundle 层（那是部署级默认，理论上应该被用户层覆盖）；如果确实没生效，检查 `installSettingsSection` 的 `onChange` 回调有没有被正确触发——某些"注册时捕获的事实"（比如 `retryPolicy`）需要显式 `replace()` 重新注册路由才能生效，纯粹改配置读取路径是不够的。
+- **改了 Web UI 的模型设置没生效**：先确认改的是不是 `cordis.yml`/Bundle 层（那是部署级默认，理论上应该被用户层覆盖）；如果确实没生效，检查 `loader/volatile-update` 事件之后 `ensureRegistrationFacts` 有没有跑通——某些"注册时捕获的事实"不会被重新解析，比如 `retryPolicy` 是在 `registration` 注册时从当时的配置里读出来的，配置变更后需要 `registration.replace([PROVIDER], ...)` 重新注册一次路由才能让新的重试策略生效（`ctx.on('loader/volatile-update', ensureRegistrationFacts)` 监听器里正是这么做的，`// packages/llm/llm-deepseek/src/index.ts`），纯粹改配置读取路径是不够的。
 - **以为密钥可以直接写在 `cordis.yml` 的 `apiKeyEnv` 里**：`apiKeyEnv` 永远是一个环境变量名（引用），不是密钥值本身；真正的值要么在启动环境里，要么在 `$DSH_HOME/.credentials.yaml` 里，参见第 01 篇。
 - **给 `llm-pi-ai` 声明了一个路由但没生效**：检查路由名有没有和其他已注册的路由冲突，以及 `models` 数组里的字段是否符合 schema（比如 `id` 不能为空、`contextWindow` 必须是正整数）——`resolveModels`/`resolveAdapterOptions` 这类函数在装配阶段就会对这些值做严格校验,校验失败会直接抛错而不是静默忽略。
 

@@ -5,7 +5,7 @@
 ## 学习目标
 
 - 理解 `SessionEventMap` 里各类事件（`turn/start`、`user/message`、`assistant/attempt`、`tool/call`、`request/header` 等）分别记录了什么语义，哪些是"日志专用、不产生消息"的记录，哪些会真正进入模型看到的历史。
-- 理解 Surface 概念：`SurfaceEventType` 包含四种事件（`system/message`/`user/message`/`assistant/message`/`tool/result`——早期版本这里只有后三种，`system/message` 是后来加入的），以及 `SurfaceOp` 的 `append` 与 `{ op: 'replace' }` 两种写入方式分别对应什么场景。
+- 理解 Surface 概念：`SurfaceEventType` 包含五种事件（`system/message`/`developer/message`/`user/message`/`assistant/message`/`tool/result`——早期版本这里只有后三种，`system/message` 与 `developer/message` 是后来先后加入的），以及 `SurfaceOp` 的 `append` 与 `{ op: 'replace' }` 两种写入方式分别对应什么场景。
 - 通读 `Session.append()` 与 `foldSurface()`/`SurfaceManager` 的真实实现，理解"日志不可变，但可见视图可以折叠重写"这句话在代码层面具体是怎么落地的。
 - 理解 `Session.deriveMessages()` 的增量缓存策略：为什么一次调用的开销是 O(新增节点数) 而不是 O(全部历史)。
 - 通过 `RuntimeContextProjection` 这个具体案例，理解插件如何"只读日志、增量维护自己的投影状态"，而不需要维护一份独立的、可能与日志失配的可变状态。
@@ -38,10 +38,12 @@
 
 这四类事件不产生任何模型可见消息，纯粹是"这里是一个 turn/step 的开始或结束"的书签，供回放和调试定位。
 
-**产生模型消息的三类事件**（下一节展开细节）：
+**产生模型消息的五类事件**（下一节展开细节）：
 
 ```typescript
 'user/message': UserMessage
+'system/message': { turn: number; step: number; message: SystemMessage }
+'developer/message': { turn: number; step: number; message: DeveloperMessage; headerSeq?: SessionSeq }
 'assistant/message': { turn: number; step: number; message: AssistantMessage; usage?: TokenUsage }
 'tool/result': { turn: number; step: number; message: ToolResultMessage; error?: {...}; meta?: JsonValue }
 ```
@@ -54,7 +56,7 @@
 'tool/call': { turn: number; step: number; callId: ToolCallId; name: string; arguments: string }
 ```
 
-> **2026-09 更新**：早期版本这里是 `'assistant/chunk': { turn: number; step: number; chunk: StreamChunk }`——每一个原始 chunk 单独落一条事件。现在这类事件已经不存在于当前 session 格式里（只在历史的 v0/v1 格式迁移代码中还能看到），换成了 `assistant/attempt`：一次模型请求尝试对应**一条**事件，携带一份紧凑打包过的 `stream: AssistantStreamRecord[]`（把连续的同类 delta 合并存储，但依然可以无损展开回原始的逐 chunk 时间序列）。第三篇《流式输出管道》详细讲了这个压缩算法和背后的动机。
+> **2026-09 更新**：早期版本这里是 `'assistant/chunk': { turn: number; step: number; chunk: StreamChunk }`——每一个原始 chunk 单独落一条事件。现在这类事件已经不存在于当前 session 格式里（只在 v0/v1 时代的历史格式迁移代码——`session-format-v0-to-v1` 与 `session-format-v1-to-v2`——中还能看到；当前格式已演进至 V4，`packages/session/` 下保留着 `session-format-v0-to-v1` … `session-format-v3-to-v4` 的完整迁移链），换成了 `assistant/attempt`：一次模型请求尝试对应**一条**事件，携带一份紧凑打包过的 `stream: AssistantStreamRecord[]`（把连续的同类 delta 合并存储，但依然可以无损展开回原始的逐 chunk 时间序列）。第三篇《流式输出管道》详细讲了这个压缩算法和背后的动机。
 
 `assistant/attempt` 记录的是**逐 token 的原始流**（以紧凑形式），`tool/call` 记录的是模型发出的**原始调用**（`arguments` 是模型输出的原始 JSON 字符串，未解析）——这两类都不是"消息"，但对回放保真度至关重要（第三篇细讲）。
 
@@ -63,43 +65,47 @@
 ```typescript
 'request/header': { header: EpochHeader; reason: RequestHeaderReason }
 'request/context': RequestContext
-'todo/write': { todos: TodoItem[] }
-'session/end-seed': Record<string, never>
+'session/end-seed': { inherited?: true }
 ```
 
-`request/header` 记录的是"下一次请求会用的完整配置"（provider、model、渲染好的 system prompt、工具 schema），`RequestHeaderReason` 的三个取值——`'initial'`（日志的第一条 header）、`'resume'`（同一个日志上，这个进程实例第一次发请求，比如进程重启后）、`'change'`（后续请求换了配置）——精确记录了"配置在什么时候真的变了"，而不是每次请求都重复写一遍。
+（早期版本的核心词表里还有一条 `'todo/write': { todos: TodoItem[] }`，它现在不再内置在 `SessionEventMap` 里，而是由 `packages/todo/tool-todo` 通过 `declare module` 合并进来——这本身就是上一段说的 merge-extensible 机制的一个实例。）
+
+`request/header` 记录的是"下一次请求会用的完整配置"（provider、model、渲染好的 system prompt、工具 schema），`RequestHeaderReason` 的四个取值——`'initial'`（日志的第一条 header）、`'resume'`（同一个日志上，这个进程实例第一次发请求，比如进程重启或 fork 种子恢复后）、`'change'`（后续请求换了配置）、`'series'`（配置没变但显式开启了一个新的消息系列，或跟在一次 surface 替换之后）——精确记录了"配置在什么时候真的变了"，而不是每次请求都重复写一遍。
 
 值得注意的是 `ignorable` 标记（定义在 `SessionEvent` 类型上）：一个读取者遇到不认识的事件类型时，默认必须拒绝重建整个会话（因为这条事件可能改变了后续内容该如何解读），只有显式标了 `ignorable: true` 的纯信息性记录才允许被安全跳过。这是"宁可过度保守也不能悄悄丢数据"的设计取向。
 
 ### Surface：日志与"模型可见历史"之间的中间层
 
-三类产生消息的事件——`user/message`、`assistant/message`、`tool/result`——共同构成了 **Surface**（`SurfaceEventType`）。Surface 不是另一份存储，而是日志之上的一层"当前哪些事件仍然可见"的索引：
+五类产生消息的事件——`system/message`、`developer/message`、`user/message`、`assistant/message`、`tool/result`——共同构成了 **Surface**（`SurfaceEventType`）。Surface 不是另一份存储，而是日志之上的一层"当前哪些事件仍然可见"的索引：
 
 ```typescript
 // packages/core/session/src/types.ts
 export type SurfaceOp =
   | 'append'
-  | { op: 'replace'; start: number; end: number }
+  | { op: 'replace'; startSeq: SessionSeq; endSeq: SessionSeq }
 ```
 
-`append` 是最常见的写法——事件追加到 surface 尾部，比如一条正常的用户消息或模型回复。`{ op: 'replace', start, end }` 则是用一个新节点，把 `start` 到 `end`（按 surface 上的相对顺序，闻及两端都必须是当前 surface 上真实存在的节点）这一段整体替换掉——这正是压缩机制的底层写入原语（第四篇会看到 `compaction-basic` 如何用它把一大段历史换成一条摘要）。
+`append` 是最常见的写法——事件追加到 surface 尾部，比如一条正常的用户消息或模型回复。`{ op: 'replace', startSeq, endSeq }` 则是用一个新节点，把 `startSeq` 到 `endSeq`（按事件 seq 定位，即两端都必须是当前 surface 上真实存在的节点）这一段整体替换掉——这正是压缩机制的底层写入原语（第四篇会看到 `compaction-basic` 如何用它把一大段历史换成一条摘要）。
 
 Surface 的折叠逻辑在 `packages/core/session/src/surface.ts` 的 `foldSurface()`（一次性折叠整份日志）和 `SurfaceManager`（增量维护，`Session` 内部持有的实例）里：
 
 ```typescript
 // packages/core/session/src/surface.ts
-export function foldSurface(events: readonly SessionEvent[]): SurfaceFoldResult {
+export function foldSurface(
+  events: readonly SessionEvent[],
+  projections: readonly SessionMessageProjection[] = [],
+): SurfaceFoldResult {
   const state = createFoldState()
   const replacements: SurfaceFoldReplacement[] = []
   for (const [index, event] of events.entries()) {
-    const replacement = applySurfaceEvent(state, event, index, events, 0)
+    const replacement = applySurfaceEvent(state, event, SessionSeq(index), events, SessionLogOffset(0), projections)
     if (replacement !== undefined) replacements.push(replacement)
   }
-  return { nodes: [...state.nodes], replacements }
+  return { nodes: [...state.nodes], replacements, projectedMessages: new Map(state.projectedMessages) }
 }
 ```
 
-`applySurfacePlan` 的核心操作只有两行：
+`applySurfacePlan` 的核心操作只有三个分支：
 
 ```typescript
 // packages/core/session/src/surface.ts
@@ -108,10 +114,15 @@ if (plan?.kind === 'append') {
 } else if (plan?.kind === 'replace') {
   state.nodes.splice(plan.startIdx, plan.endIdx - plan.startIdx + 1, plan.seq)
   state.replaceGeneration += 1
+  state.contentGeneration += 1
+} else if (plan?.kind === 'project') {
+  for (const [seq, message] of plan.messages) state.projectedMessages.set(seq, message)
+  state.projections.add(plan.projection)
+  state.contentGeneration += 1
 }
 ```
 
-`append` 就是往 `nodes`（当前可见的事件 seq 列表）尾部追加一个 seq；`replace` 是用 `Array.splice` 把一段连续的旧 seq 整体换成一个新 seq——**注意这只是修改"当前可见的索引"，被替换掉的旧事件本身仍然原样留在日志（`events`/`this.log`）里，从来没有被删除或修改**。每发生一次 `replace`，`replaceGeneration` 就加一，这个计数器后面会用来判断"派生消息缓存是否需要重新构建"。
+`append` 就是往 `nodes`（当前可见的事件 seq 列表）尾部追加一个 seq；`replace` 是用 `Array.splice` 把一段连续的旧 seq 整体换成一个新 seq——**注意这只是修改"当前可见的索引"，被替换掉的旧事件本身仍然原样留在日志（`events`/`this.log`）里，从来没有被删除或修改**。第三个分支 `project` 服务于新加入的 `SessionMessageProjection` 机制：插件可以把"某个事件在投影层对应的消息"登记进 `projectedMessages`，折叠结果里会携带这份映射供 `deriveEventMessage` 查询。每发生一次 `replace` 或 `project`，`contentGeneration` 就加一（`replaceGeneration` 只在 `replace` 时加一），这个计数器后面会用来判断"派生消息缓存是否需要重新构建"。
 
 写入 Surface 有严格的正确性校验，比如替换操作要求新事件的 `sourceEventSeqs` 必须**完整覆盖**被遮蔽的每一个旧 seq：
 
@@ -130,12 +141,19 @@ if (missing.length > 0) {
 一个 Surface 上的事件如何变成模型看到的一条 `Message`，规则集中在一个纯函数里：
 
 ```typescript
-// packages/core/session/src/surface.ts
-export function deriveEventMessage(event: SessionEvent): Message | null {
+// packages/core/session/src/surface.ts（节选，省略注释）
+export function deriveEventMessage(
+  event: SessionEvent,
+  projectedMessages?: ReadonlyMap<SessionSeq, Message>,
+): Message | null {
+  const projected = projectedMessages?.get(event.seq)
+  if (projected !== undefined) return projected
   switch (event.type) {
     case 'user/message': {
       return event.data
     }
+    case 'system/message':
+    case 'developer/message':
     case 'assistant/message': {
       if (event.data.message.content.length === 0) return null
       return event.data.message
@@ -149,18 +167,18 @@ export function deriveEventMessage(event: SessionEvent): Message | null {
 }
 ```
 
-三条规则里藏着一个不起眼但很重要的细节：`assistant/message` 如果 `content` 是空数组，会返回 `null`——即"这个 surface 节点存在，但不产生任何消息"。这对应一种特殊场景：一次 step 因为 `max-tokens` 被截断，模型这一步什么内容都没产出、只携带了一份 usage 统计,这类事件被记录下来（为了 usage 账目完整）,但绝不能在派生历史里插入一条空的 assistant 轮次——那会让下一次请求的消息序列出现语义上没有意义的空发言。
+几条规则里藏着一个不起眼但很重要的细节：`assistant/message` 如果 `content` 是空数组，会返回 `null`——即"这个 surface 节点存在，但不产生任何消息"。这对应一种特殊场景：一次 step 因为 `max-tokens` 被截断，模型这一步什么内容都没产出、只携带了一份 usage 统计,这类事件被记录下来（为了 usage 账目完整）,但绝不能在派生历史里插入一条空的 assistant 轮次——那会让下一次请求的消息序列出现语义上没有意义的空发言。同一条规则也适用于后加入的 `system/message`/`developer/message`：空内容的系统/开发者节点保留它们在 surface 上的位置，但不往模型请求里塞一条空消息。另外函数现在接受一个可选的 `projectedMessages` 映射——前面 `SessionMessageProjection` 机制登记进去的投影消息优先于内置规则命中。
 
 ### deriveMessages()：增量缓存的派生历史
 
 `Session.deriveMessages()` 是外部真正拿到"当前完整消息历史"的唯一入口，`buildRequest()` 每次组装请求前都会调用它。它的实现刻意做了增量缓存：
 
 ```typescript
-// packages/core/session/src/index.ts
+// packages/core/session/src/index.ts（节选，省略注释）
 deriveMessages(): Message[] {
   const surface = this.surface
   const nodes = surface.nodes
-  const generation = surface.replaceGeneration
+  const generation = surface.contentGeneration
   if (generation !== this.derivedGeneration) {
     this.derived = []
     this.derivedNodes = 0
@@ -175,7 +193,7 @@ deriveMessages(): Message[] {
 }
 ```
 
-逻辑是：只要 `replaceGeneration`（前面提到的、每次 `replace` 都会自增的计数器）没变，说明这段时间只发生了 `append`，那就只需要把"上次已经投影过的位置"之后的新节点投影一遍、追加进缓存数组；如果 `replaceGeneration` 变了（发生过一次压缩替换），说明整个 surface 的节点排列可能被重新调整过，缓存被整体清空重建。这让"没有压缩发生的正常对话"每次调用的开销只有 O(新增节点数)，而不是每次都要把整份历史重新投影一遍——对一个可能有几千条事件的长会话来说，这个差别是数量级的。
+逻辑是：只要 `contentGeneration`（前面提到的、`replace` 与 `project` 都会自增的计数器）没变，说明这段时间只发生了 `append`，那就只需要把"上次已经投影过的位置"之后的新节点投影一遍、追加进缓存数组；如果 `contentGeneration` 变了（发生过一次压缩替换或一次投影更新），说明整个 surface 的节点排列或投影结果可能被调整过，缓存被整体清空重建。这让"没有压缩发生的正常对话"每次调用的开销只有 O(新增节点数)，而不是每次都要把整份历史重新投影一遍——对一个可能有几千条事件的长会话来说，这个差别是数量级的。
 
 同一套"缓存 + 增量重新折叠"的模式还出现在 `requestHeader()`（缓存最近一次 `request/header` 折叠结果）和 `requestContext()`（缓存最近一次 `request/context`）上，三者都遵循相同的原则：**日志是唯一权威源，任何派生状态都可以随时从某个前缀重新算出来，缓存只是一个性能优化，绝不是另一份独立事实**。
 
@@ -188,7 +206,7 @@ deriveMessages(): Message[] {
 append<T extends SessionEventType>(
   type: T,
   data: SessionEventMap[T],
-  ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : []
+  ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent<T>] : []
 ): SessionEvent<T> {
   const dataSnapshot = snapshotJsonValue(data)
   if (dataSnapshot === undefined) {
@@ -196,7 +214,7 @@ append<T extends SessionEventType>(
   }
   // ...
   const event = deepFreeze({
-    type, seq: this.log.length, time: Date.now(), data: dataSnapshot,
+    type, seq: SessionSeq(this.log.length), time: Date.now(), data: dataSnapshot,
     ...(surfaceMetadataSnapshot as { surfaceOp?: unknown; sourceEventSeqs?: unknown }),
   } as unknown as SessionEvent<T>)
   this.surfaceManager.validateNext(event as SessionEvent)
@@ -220,9 +238,8 @@ export class RuntimeContextProjection {
 
   constructor(ctx: Context, session: Session) {
     const surface = new Set(session.surface.nodes)
-    for (let index = session.events.length - 1; index >= 0; index -= 1) {
-      const event = session.events[index]
-      if (event?.type !== 'user/message' || !isOwned(event.data)) continue
+    for (const event of eventsNewestFirst(session)) {
+      if (event.type !== 'user/message' || !isOwned(event.data)) continue
       this.retained ??= null
       if (surface.has(event.seq)) {
         this.retained = { seq: event.seq, text: textOf(event.data) }
@@ -256,7 +273,7 @@ export class RuntimeContextProjection {
 
 ## 小结
 
-- 会话的唯一事实来源是一份 append-only、深度冻结、强 JSON 校验的事件日志；`SessionEventMap` 里的事件分为"产生消息"（四种 Surface 事件，含新加入的 `system/message`）和"不产生消息但记录过程"（边界标记、紧凑流记录 `assistant/attempt`、请求头快照等）两大类。
+- 会话的唯一事实来源是一份 append-only、深度冻结、强 JSON 校验的事件日志；`SessionEventMap` 里的事件分为"产生消息"（五种 Surface 事件，含后来加入的 `system/message` 与 `developer/message`）和"不产生消息但记录过程"（边界标记、紧凑流记录 `assistant/attempt`、请求头快照等）两大类。
 - Surface 是日志之上的一层可重写索引：`append` 追加、`{ op: 'replace' }` 替换，替换只改变"当前可见范围",从不删除或修改原始事件——这就是"日志不可变、但可见视图可以折叠"的具体实现。
-- `deriveMessages()`、`requestHeader()`、`requestContext()` 都是"缓存 + 按需增量重折叠"的派生投影,而不是独立维护的可变状态；`replaceGeneration` 是判断"要不要整体重建缓存"的信号。
+- `deriveMessages()`、`requestHeader()`、`requestContext()` 都是"缓存 + 按需增量重折叠"的派生投影,而不是独立维护的可变状态；`contentGeneration` 是判断"要不要整体重建缓存"的信号。
 - 任何需要"记住点什么、跨进程重启也要对得上"的插件，都应该参照 `RuntimeContextProjection` 的写法：构造时从日志回溯重建一次性状态，之后订阅 `session/event` 增量维护，绝不自己另开一份独立于日志的持久状态。

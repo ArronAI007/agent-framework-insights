@@ -51,12 +51,28 @@ export abstract class WorkflowEngine extends Service {
 `ctx.workflowEngine` 故意做得极简——**只有一个方法** `start()`。没有"列出所有运行中的工作流""按 id 停止某个工作流"这类管理 API,因为控制权完全交给调用方拿到手的句柄 `WorkflowRun`(`packages/workflow/workflow/src/runtime-types.ts:40-49`):
 
 ```typescript
+// packages/workflow/workflow/src/runtime-types.ts:40-49
 export interface WorkflowRun {
 	readonly id: WorkflowRunId
 	readonly meta: WorkflowMeta
 	readonly result: Promise<WorkflowResult>
 	cancel(reason?: string): void
 	dispose(): Promise<void>
+}
+```
+
+请求形状 `WorkflowStartRequest`(`runtime-types.ts:19-34`)相对课程写作时新增了两个**每次运行可选**的覆写:
+
+```typescript
+// packages/workflow/workflow/src/runtime-types.ts:19-34(节选)
+export interface WorkflowStartRequest {
+	script: string
+	meta: WorkflowMeta
+	args?: unknown
+	subagentProvider?: string  // 相对课程写作时新增:本次运行所有 agent() 统一走这个 Provider
+	maxTotalAgents?: number    // 相对课程写作时新增:本次运行的子代理总数上限
+	parent: Agent
+	signal?: AbortSignal
 }
 ```
 
@@ -122,26 +138,30 @@ export interface WorkflowRun {
 
 ### `tool-workflow`:模型编写 JS 编排脚本的入口
 
-`packages/workflow/tool-workflow/src/index.ts` 是模型真正调用的工具。它要求的参数很直接:`script`(纯 JS 正文字符串,不需要写 `export const meta` 这种头部)、`meta`(单独的对象参数:`name`/`description` 必填,`whenToUse`/`phases` 可选)、`args`(可选的 JSON 对象,会作为 `args` 全局量注入脚本)。
+`packages/workflow/tool-workflow/src/index.ts` 是模型真正调用的工具。它要求的参数很直接:`script`(纯 JS 正文字符串,不需要写 `export const meta` 这种头部)、`meta`(单独的对象参数:`name`/`description` 必填,`whenToUse`/`phases` 可选)、`args`(可选的 JSON 对象,会作为 `args` 全局量注入脚本),以及相对课程写作时新增的第四个参数 `run_in_background`(默认 true;`enableRunInBackground: false` 的部署连这个参数都不会暴露,硬传 `true` 会在执行期被拒)。
 
 值得一提的是 `meta` 被设计成**单独的数据参数,而不是脚本里的一段代码**——这是刻意偏离 Claude Code 那种 `export const meta = {...}` 写法的地方,原因是如果 `meta` 也是脚本的一部分,宿主就得在 worker 隔离生效之前对它求值(比如脚本里塞一个带副作用的 getter),这恰好绕开了本该保护的边界。源码里甚至专门写了一段正则检查,一旦发现脚本尝试用 CC 风格的头部,会给出明确报错而不是默默兼容。
 
-`execute()` 的核心流程:检查调用方必须是一个真实的 Agent → 调用 `ctx.workflowEngine.start({ script, meta, args, parent, signal })` → 把工具调用自身的 `AbortSignal` 桥接到 `run.cancel()` → `await run.result` → 把非 `completed` 的 `stopReason` 统一转成一个会被上抛的 `Error` → 成功时返回 `{ runId, agentsStarted, result }` → `finally` 里永远调用 `run.dispose()`。这条收尾逻辑和上一篇 `tool-subagent` 的 `settleForegroundRun` 几乎是同一个模式的重复出现——`await` 主结果、映射失败原因、`finally` 里无条件释放资源。
+脚本侧的调用面也有一点细节扩展:`agent()` 的 `opts` 除了 `label`/`phase`/`schema`,现在还接受独立的 `provider`/`model` LLM 路由覆写(可以只给其一),`meta.phases` 的每一项也允许携带 `provider`/`model`;除此之外的陌生选项(`effort`/`isolation`/`agentType` 之类)一律"响亮的报错"(fail loud)而不是被忽略。
+
+`execute()` 现在有前台/后台两条路径。**前台**路径:检查调用方必须是一个真实的 Agent → 调用 `ctx.workflowEngine.start({ script, meta, args, parent, signal })` → 把工具调用自身的 `AbortSignal` 桥接到 `run.cancel()` → `await run.result` → 把非 `completed` 的 `stopReason` 统一转成一个会被上抛的 `Error` → 成功时返回 `{ runId, agentsStarted, result }` → `finally` 里永远调用 `run.dispose()`。这条收尾逻辑和上一篇 `tool-subagent` 的 `settleForegroundRun` 几乎是同一个模式的重复出现。**后台**路径(`startBackgroundRun()`):把整个运行注册成一个 `ctx.jobs` 任务(`kind: 'workflow'`,`owner` 是父 Agent),调用**立即返回** `{ kind: 'background', jobId, runId }`,脚本继续在后台编排;`jobs.start` 的 `run` 回调内部才启动引擎——引擎的同步拒绝(meta 非法、脚本解析失败)会从 starter 里直接抛回,模型看到的就是一条普通工具错误;任务的 `cancel` 回调映射到 `run.cancel()`,`done` 回调负责 `await run.dispose()` 并把 `WorkflowResult` 折成 `JobOutcome`。脚本的返回值随任务的完成通知回来,模型之后用 `job_output` 查、用 `job_kill` 停。
+
+工具还内建了一个运行记录器(`createWorkflowRecorder`):运行期间把 `tool-workflow/run-start`/`agent-start`/`agent-end`/`run-end` 四条包私有的 log-only 事件追加进**父会话**日志,让一次 workflow 的编排轨迹(每个 `agent()` 的启动与结局)能脱离对话历史被回放审计;追加失败只记一条 warning 并停用记录,绝不影响工具执行本身。
 
 ### `tool-ralph`:每轮全新子代理的固定前台循环
 
 如果说 `tool-workflow` 是"给模型一把编排的刀",`tool-ralph` 就是"用这把刀固定打磨出的一件成品工具"——模型侧只能配置两个参数:
 
 ```typescript
-// packages/workflow/tool-ralph/src/index.ts(节选,参数)
+// packages/workflow/tool-ralph/src/index.ts(节选,模型参数)
 // objective: string  — 必填,不可变的目标
 // maxRounds: number  — 可选,受部署方 Config.maxRounds 上限约束,默认 256
 ```
 
-没有 prompt 模板参数,没有停止条件参数——Provider、结构化输出 schema、循环脚本本身,统统是部署方在配置里锁死的,模型完全无法定制。核心循环是一段固定的 JS 字符串 `RALPH_SCRIPT`,走的是和 `tool-workflow` 完全同一套 `ctx.workflowEngine`/`agent()` 机制:
+没有 prompt 模板参数,没有停止条件参数——Provider、结构化输出 schema、循环脚本本身,统统是部署方在配置里锁死的,模型完全无法定制。部署侧的 `Config` 一共四个键(`packages/workflow/tool-ralph/src/index.ts:21-38`):`subagentProvider`(每轮 fresh 子代理走哪个 Provider,默认 `'spawn'`)、`maxRounds`(模型可传轮数的天花板,默认 256)、`maxHandoffChars`(单轮交接报告序列化后的字符上限,默认 16384)、`maxResultChars`(相对课程写作时新增:面向父代理的终态渲染文本上限,默认 16384,超出按截断告示截短)。核心循环是一段固定的 JS 字符串 `RALPH_SCRIPT`,走的是和 `tool-workflow` 完全同一套 `ctx.workflowEngine`/`agent()` 机制:
 
 ```javascript
-// packages/workflow/tool-ralph/src/index.ts:152-176(RALPH_SCRIPT 节选)
+// packages/workflow/tool-ralph/src/index.ts:150-175(RALPH_SCRIPT 节选)
 phase('Fresh-agent rounds')
 for (let round = 1; round <= args.maxRounds; round += 1) {
 	const prior = previous === undefined ? '(none — this is the first round)' : JSON.stringify(previous)
@@ -170,7 +190,7 @@ return { status: 'budget-limited', roundsStarted: args.maxRounds, report: previo
 为了保证"全新"这件事不被悄悄破坏,工具还专门加了一层守卫,在启动循环前校验绑定的 Provider 必须是真正无状态的:
 
 ```typescript
-// packages/workflow/tool-ralph/src/index.ts:220-231
+// packages/workflow/tool-ralph/src/index.ts:217-230
 function requireFreshProvider(ctx: Context, name: string): SubagentProvider {
 	const provider = ctx.subagents.getProvider(name)
 	if (provider === undefined) {
@@ -188,7 +208,9 @@ function requireFreshProvider(ctx: Context, name: string): SubagentProvider {
 
 这里直接检查上一篇讲过的 `SubagentProvider.inheritsParentContext` 字段——如果部署方手滑把 Ralph 绑定到了 `fork-in-process`(会继承父对话历史的那个 Provider),工具会直接拒绝启动,而不是悄悄跑出一个"看起来是全新、实际上带了历史"的 Ralph 循环。这是"每轮从干净状态开始"这条设计承诺,从提示词层面的口头约定,进一步落到了代码层面的硬校验。
 
-**每轮之间到底传递了什么、解决了什么问题?** 恰好只有两样东西跨轮传递:(1)共享的文件系统工作区及其当前工作树——这被明确定位为"长期记忆和事实来源",提示词里反复强调"检查工作区、保留已有工作、核实你做的改动";(2)一份体量很小的结构化 JSON 报告(`status`/`summary`/`evidence`/`nextSteps`/`blocker`,受 `maxHandoffChars` 上限约束,默认 16384 字符)。没有对话历史,没有 git commit 协议,没有除了"工作区"之外的暂存文件约定。
+启动循环时,`execute()` 会把刚讲过的两个每运行覆写一并交给引擎(`tool-ralph/src/index.ts:445-453`):`ctx.workflowEngine.start({ script: RALPH_SCRIPT, meta: RALPH_META, args: { objective, maxRounds, maxHandoffChars }, subagentProvider: resolved.subagentProvider, maxTotalAgents: maxRounds, parent, signal })`——Provider 选择和"子代理总数正好等于轮数上限"这两个部署意图,都是穿过引擎的通用请求形状带进去的,而不是 Ralph 私有的特殊通道。另一个值得注意的细节:脚本内部 `validateReport()` 的结论并不被宿主直接采信——终态回到 host 侧后,`readRunResult()`/`readReport()` 会把返回值**再严格校验一遍**:整体形状、归一化字符串(非空、无首尾空白)、每种 status 对应的字段约束(`complete` 必须有 evidence 且无 nextSteps、`blocked` 必须有具体 blocker……)、交接长度,任何一项不满足都直接抛错。这是"跨程序边界回来的数据一律不信任"的又一处体现;不过要分清,它校验的是报告的**形状**,不是内容的真伪。
+
+**每轮之间到底传递了什么、解决了什么问题?** 恰好只有两样东西跨轮传递:(1)共享的文件系统工作区及其当前工作树——这被明确定位为"长期记忆和事实来源",提示词里反复强调"检查工作区、保留已有工作、核实你做的改动";(2)一份体量很小的结构化 JSON 报告(`status`/`summary`/`evidence`/`nextSteps`/`blocker`,受 `maxHandoffChars` 上限约束,默认 16384 字符;面向父代理的终态渲染文本另受 `maxResultChars` 约束,默认同为 16384,超出部分带截断告示截短)。没有对话历史,没有 git commit 协议,没有除了"工作区"之外的暂存文件约定。
 
 这恰恰就是设计意图所在——完全对话式的连续委派(比如反复对同一个子代理 `send_message`),会让子代理的上下文随轮次线性增长,越往后越容易被早期的错误判断或过时信息"带偏";而 `tool-ralph` 用"每轮开全新脑子 + 工作区当共享记事本 + 一份小报告当交接"的组合,既避免了上下文污染和跨轮的隐性状态积累,又不至于让每轮都从零开始摸索——工作区里已经完成的改动是看得见的事实,不需要被重新描述一遍。
 

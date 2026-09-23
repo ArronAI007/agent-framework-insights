@@ -54,14 +54,14 @@ are unavailable across the engines range.
 // apps/cli/package.json（节选）
 {
   "name": "@deepseek-ai/dsh",
-  "description": "dsh CLI: profile boot, plugin management, and the browser UI alias",
+  "description": "dsh CLI: profile launch, plugin management, and configuration inspection",
   "type": "module",
   "bin": {
     "dsh": "lib/bin.js"
   },
   "files": [
     "lib/*.js",
-    "config"
+    "lib/types/*.d.ts"
   ],
   ...
 }
@@ -69,9 +69,9 @@ are unavailable across the engines range.
 
 npm 包名是 `@deepseek-ai/dsh`,但它声明的 `bin.dsh` 指向构建产物 `lib/bin.js`——这正是 `apps/cli/src/bin.ts` 编译后的产物。`apps/cli` 这个包本身依赖了一长串 workspace 内部包（`dsh-base`、`dsh-web-app`、`dsh-headless`、各种 `dsh-tool-*`），这些依赖并不是运行时才动态拉取的插件，而是 CLI 包自己在 `package.json` 里显式声明的依赖——`dsh` 命令能装配出哪些 Profile,取决于这个包依赖了哪些 bundle。
 
-### 命令分发：`bin.ts` 里的三种模式
+### 命令分发：`bin.ts` 里的四种模式
 
-`apps/cli/src/bin.ts` 是整个 CLI 的入口，逻辑很短：先解析参数,再按模式分发到不同的实现文件（下面这段是当前仓库的真实实现，比早期版本多了一层错误兜底和一个显式的执行入口守卫）：
+`apps/cli/src/bin.ts` 是整个 CLI 的入口，逻辑很短：先解析参数,再按模式分发到不同的实现文件（下面这段是当前仓库的真实实现，比早期版本多了一层错误兜底和一个显式的执行入口守卫，以及 0.1.7 新增的第四种模式 `dump-config-schema`）：
 
 ```typescript
 // apps/cli/src/bin.ts
@@ -117,6 +117,11 @@ export async function runCli(): Promise<void> {
       )
       break
     }
+    case 'dump-config-schema': {
+      const { runDumpConfigSchema } = await import('./dump-config-schema.ts')
+      await runDumpConfigSchema(invocation.profile, invocation.patches, invocation.fromDefaultProfile)
+      break
+    }
     default:
       invocation satisfies never
       throw new Error(`dsh: unhandled invocation mode ${JSON.stringify(invocation)}`)
@@ -130,9 +135,11 @@ if (import.meta.main) {
 
 三个值得留意的变化：
 
-1. **每个分支依旧用动态 `import()`**而不是顶层静态导入——这一点没变。如果你只是运行 `dsh plugin --profile tui add some-package`，进程根本不需要加载 `profile-boot.ts` 里那一整套"装配插件树、启动 HTTP 服务"的代码——三种模式互不污染彼此的加载路径，启动速度和内存占用都更可控。`invocation satisfies never` 这一行是 TypeScript 的"穷尽性检查"写法：如果未来 `DshInvocation` 联合类型新增了一个模式而这里忘了处理，编译期就会报错，而不是留到运行时才发现分发逻辑漏了一支。
+1. **每个分支依旧用动态 `import()`**而不是顶层静态导入——这一点没变。如果你只是运行 `dsh plugin --profile tui add some-package`，进程根本不需要加载 `profile-boot.ts` 里那一整套"装配插件树、启动 HTTP 服务"的代码——四种模式互不污染彼此的加载路径，启动速度和内存占用都更可控。`invocation satisfies never` 这一行是 TypeScript 的"穷尽性检查"写法：如果未来 `DshInvocation` 联合类型新增了一个模式而这里忘了处理，编译期就会报错，而不是留到运行时才发现分发逻辑漏了一支。
 2. **分发逻辑被包进了一个导出的 `runCli()` 函数，配合 `if (import.meta.main)` 守卫**——这不只是代码风格调整：把整个 CLI 主流程做成一个可以被 `import` 的函数，意味着测试代码或者未来别的入口（比如桌面壳，见下文）可以直接调用 `runCli()`，而不必真的 fork 一个子进程去跑 `bin.ts`；`import.meta.main` 是 Node 用来判断"当前模块是不是被直接执行的入口文件"的标准写法，只有满足这个条件才会自动跑一次 `runCli()`，被别处 `import` 时则不会有副作用。
 3. **`profile` 分支新增了 `try/catch`，专门捕获 `StartupError` 并交给 `reportStartupFailure` 统一渲染**——之前的版本里，装配阶段的任何失败都会是一段裸的 Node 异常堆栈；现在 `profile-boot.ts` 会把"可预期的启动失败"（比如补丁文件语法错误、缺少必需的凭证引用）包装成 `StartupError`，`bin.ts` 捕获后调用 `reportStartupFailure` 生成一份带 `$DSH_HOME`、版本号、Profile 名字上下文的诊断信息，再用 `process.exit(1)` 退出——这是"给用户看得懂的错误提示"和"给开发者看的完整堆栈"之间的一个折中：只有 `StartupError` 会被这样格式化，其他意料之外的异常仍然会原样抛出，不会被这层 catch 悄悄吞掉。
+
+另外注意分发表里多出来的第四个分支 **`dump-config-schema`**（`--dump-config-schema`，0.1.7 新增）：它和 `--dump-config` 一样不启动进程，但打印的不是补丁层列表，而是组合树里各插件声明的 JSON Schema。它和 `profile`/`dump-config` 的具体边界下一篇会展开。
 
 ### `web` 是 `--profile web` 的别名
 
@@ -187,7 +194,9 @@ function webCommand(): Command {
   return new Command()
     .name('dsh --profile web')
     .description('Serve the DeepSeek Harness browser UI.')
+    .helpOption('-h, --help', 'show this help')
     .option('--host <host>', 'bind host')
+    .option('--no-open', 'do not open the Web UI in the default browser')
     .option('--port <port>', 'listen port; pass 0 to let the OS pick a free one')
     .option('--trusted-host <authority...>', 'extra authority the /api browser-trust fence accepts (host or host:port; repeatable)')
     ...
@@ -207,11 +216,13 @@ export function apply(ctx: Context): void {
 
 这里能看到一条明确写在代码里的安全策略：**`--host 0.0.0.0` 被显式拒绝**。理由很直白——Web UI 背后是一个可以执行任意 shell 命令的编码 Agent，一旦绑定到 `0.0.0.0`，局域网内任何设备都能访问到这个"远程代码执行入口"。默认只绑定 `127.0.0.1`（仅本机可访问），这不是一个可以随手改掉的配置项，而是代码里的一条硬性校验。
 
+另一个值得知道的变化是：**当前版本 `dsh web` 启动完成后会默认打开系统浏览器**（`web-runtime` 行读取 `webStartup.openBrowser`），新出现的 `--no-open` 就是用来关掉这个行为的开关——在远程终端或 CI 环境里跑 `dsh web` 时记得加上它。
+
 ### 第一次会话的心智模型
 
 不管是终端还是浏览器打开 `dsh web` 之后的地址，"用户输入一个任务"到"Agent 开始工作"这条路径的抽象是一致的：
 
-1. **传输层接住请求**：`packages/bundle/web-app/cordis.patch.yml` 里的 `api-gateway`（`@deepseek-ai/dsh-host-apiproxy`）是"每种客户端形态共享的、与传输协议无关的分发面"，浏览器发来的 HTTP/WebSocket 请求经由 `webserver` 绑定的端口，落到这个网关上；
+1. **传输层接住请求**：网关在装配树里的行叫 `typert-gateway`（`@deepseek-ai/dsh-api-gateway`，0.1.7 起由 `dsh-base` 层提供，早期版本里它叫 `api-gateway`、挂在 `dsh-web-app` 层），是"Host 侧 Typert RPC 分发端点"（`packages/api/gateway`，Host 服务 `ctx.typertGateway`）；浏览器发来的 HTTP/WebSocket 请求经由 `webserver` 绑定的端口，落到这个网关上——web-app 层里的 `connection` 行（`@deepseek-ai/dsh-client-connection`）负责把网关绑定到 webserver 的 `/api` 下；
 2. **会话被创建或恢复**：网关背后的会话相关能力（`dsh-session`、`dsh-storage`）负责把这次交互对应到一个具体的 `Session`——新会话意味着一条全新的事件日志开始被追加；
 3. **Agent 循环开始驱动**：`dsh-agent`/`dsh-agent-loop` 拿到会话后，进入"读取用户消息 → 组装请求 → 调用模型 → 执行工具调用 → 写回会话日志"的循环，这正是后续章节（第 04 章"Agent 核心循环"）要深入拆解的部分；
 4. **浏览器端渲染**：`web-app` 补丁层里的一长串 `ui-*` 插件（`ui-conversation`、`ui-tool`、`ui-workflow-run` 等）通过 WebSocket 订阅会话事件，把日志实时渲染成对话界面。
@@ -230,7 +241,7 @@ CLI（`apps/cli`）在这条链路里的角色，仅仅是**装配出承载这�
   "scripts": {
     "build": "vite build",
     "dev": "vite",
-    "watch": "vite build --watch"
+    "watch": "vite build --watch --no-emptyOutDir"
   },
   "dependencies": {
     "@deepseek-ai/dsh-client-web": "workspace:^",
@@ -242,6 +253,8 @@ CLI（`apps/cli`）在这条链路里的角色，仅仅是**装配出承载这�
 ```
 
 它的 `description` 已经写明了关系：这个包用 Vite 把 `@deepseek-ai/dsh-client-web` 这个"浏览器端插件外壳库"打包成 `dist/`，而这个 `dist/` 最终是被 `apps/cli` 的 `dsh web`（也就是 `web-app` 补丁层里的 `web-runtime` 行）解析并托管出来的静态资源。这印证了课程导读里提到的"Host 与 Client 物理分离"——`apps/web` 是纯浏览器端工程，和跑在 Node 里的 `apps/cli` 是两个独立的构建产物，只通过约定好的 `dist/` 路径和运行时 WebSocket 协议衔接。
+
+0.1.7 之后 Web 前端值得一提的新功能有两类（都是纯浏览器侧的用户体验变化，不改变装配模型）：一类是**实验性语音输入**（`apps/web` 依赖的 `@deepseek-ai/dsh-experimental-voice-input-bundle`，本地 SenseVoice 语音识别，首次使用时下载运行时）；另一类是设置体验完善——General Settings 底部新增 **Current version 行**（展示构建时的 `DSH_CLIENT_VERSION`）、模型厂商选择入口的 UX 重写。另外有一个与浏览器直接相关的平台差异：DeepSeek 账号登录入口现在只在桌面壳（Electron）里可见，Web 端被有意隐藏（上游 #4897）。
 
 ### 补充：`apps/desktop`，一个新出现的第三种运行形态
 
@@ -256,7 +269,7 @@ CLI（`apps/cli`）在这条链路里的角色，仅仅是**装配出承载这�
 }
 ```
 
-配合一个私有的 `apps/desktop-host`（`description` 是 "Private Node-mode host process for the Electron desktop application"），这是一个用 Electron 打包的原生桌面壳：把 `dsh` 运行时和一份自带的 Node 环境一起打包分发，用户不需要自己装 Node/pnpm 就能跑起完整的 Agent。这条路径本质上仍然是"装配出前面讲的同一棵插件树"，只是把"谁来托管 Web UI 的浏览器窗口"从系统浏览器换成了 Electron 自带的 Chromium——对理解"CLI 装配 Profile"这条主线没有影响，值得知道的是它的存在，具体的打包与更新机制不在本课程的讨论范围内（这是一个 2026-08-28 之后才出现的能力，本课程后续章节的源码解读仍以 `apps/cli`/`apps/web` 这条 Node/浏览器路径为主）。
+配合一个私有的 `apps/desktop-host`（`description` 是 "Private Node-mode host process for the Electron desktop application"），这是一个用 Electron 打包的原生桌面壳：把 `dsh` 运行时和一份自带的 Node 环境一起打包分发，用户不需要自己装 Node/pnpm 就能跑起完整的 Agent。这条路径本质上仍然是"装配出前面讲的同一棵插件树"，只是把"谁来托管 Web UI 的浏览器窗口"从系统浏览器换成了 Electron 自带的 Chromium——对理解"CLI 装配 Profile"这条主线没有影响，值得知道的是它的存在，具体的打包与更新机制不在本课程的讨论范围内（这是一个 2026-08-28 之后才出现的能力，本课程后续章节的源码解读仍以 `apps/cli`/`apps/web` 这条 Node/浏览器路径为主）。0.1.7 前后的桌面壳还补上了完整的引导体验：启动后先出现一个独立的 Welcome 窗口（原生窗口控制、品牌化设计），在进入工作区之前完成凭证检查——没有配置任何模型 API Key 时，Welcome 窗口会直接给出 API Key 填写页；同时 DeepSeek 账号登录也只在桌面壳内提供，Web 端不再显示这个入口。
 
 ## 常见问题/易踩坑
 
@@ -266,4 +279,4 @@ CLI（`apps/cli`）在这条链路里的角色，仅仅是**装配出承载这�
 
 ## 小结
 
-`dsh web` 和 `dsh --profile web` 是同一件事的两种写法：CLI 层只负责解析参数并选中一个 Profile，真正的"服务器绑定地址""浏览器插件树装配""任务如何变成会话"全部由被选中的 Profile（这里是 `dsh-base` + `dsh-web-app` 两层补丁叠加的结果）决定。下一篇会把 CLI 的三种模式（`profile`/`plugin`/`dump-config`）和 Profile 装配机制本身讲透，包括 `dsh --profile headless "task"` 这种一次性无人值守任务怎么跑起来。
+`dsh web` 和 `dsh --profile web` 是同一件事的两种写法：CLI 层只负责解析参数并选中一个 Profile，真正的"服务器绑定地址""浏览器插件树装配""任务如何变成会话"全部由被选中的 Profile（这里是 `dsh-base` + `dsh-web-app` 两层补丁叠加的结果）决定。下一篇会把 CLI 的四种模式（`profile`/`plugin`/`dump-config`/`dump-config-schema`）和 Profile 装配机制本身讲透，包括 `dsh --profile headless "task"` 这种一次性无人值守任务怎么跑起来。

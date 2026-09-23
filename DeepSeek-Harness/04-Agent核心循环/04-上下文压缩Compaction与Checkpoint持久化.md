@@ -52,8 +52,9 @@ ctx.on('agent/pre-step', async ({ agent, signal }, next): Promise<PreStepDecisio
 
 ```typescript
 // packages/compaction/compaction-basic/src/index.ts（节选，pressure 分支）
-const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
-const spec = resolveCompactSpec(policy, context.contextWindow)
+const info = await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)
+if (info.context === undefined) throw new TargetPressureConfigError(/* ... */)
+const spec = resolveCompactSpec(policy, info.context.contextWindow, reservedCompletionTokens(agent, info.defaultMaxTokens))
 if (measurement.totalTokens < spec.thresholdTokens) return null
 
 if (prune !== undefined) {
@@ -73,9 +74,13 @@ for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
   measurement = meter.measure(agent.session)
   if (measurement.totalTokens < spec.thresholdTokens) return result
 }
+
+throw new Error(
+  `compaction still above threshold after ${spec.compactionRetries + 1} compaction attempts (...)`,
+)
 ```
 
-流程是：先按当前路由的模型 `contextWindow` 算出一个阈值（`resolveCompactSpec`),如果当前估算的 token 数还没到阈值,直接返回 `null`（什么都不做)。到了阈值之后,先尝试一次**不需要调用模型的剪枝**（`prune.pruneSession`,由可选的 `toolResultPruner` 服务提供,专门清理旧的工具结果,详见下一节),剪枝完重新测量一次,如果这样就已经降到阈值以下,压缩到此为止,连摘要请求都不用发。只有剪枝仍然不够,才真的进入"选区 → 摘要 → 替换"的循环,而且这个循环有 `compactionRetries` 次重试上限——因为一次摘要可能因为原文太长导致摘要本身也超出预期,这时会再选一段范围重新压缩,直到测量结果降到阈值以下或者重试次数耗尽。
+流程是：先按当前路由的模型 `contextWindow` 算出一个阈值（`resolveCompactSpec`,注意它还会用 `reservedCompletionTokens` 给模型的输出预留空间）,如果当前估算的 token 数还没到阈值,直接返回 `null`（什么都不做)；模型信息里根本没有 `context`（没配 `contextWindow`）时直接抛 `TargetPressureConfigError`——也就是上一节那个"只告警一次"的容错分支要接住的错误。到了阈值之后,先尝试一次**不需要调用模型的剪枝**（`prune.pruneSession`,由可选的 `toolResultPruner` 服务提供,专门清理旧的工具结果,详见下一节),剪枝完重新测量一次,如果这样就已经降到阈值以下,压缩到此为止,连摘要请求都不用发。只有剪枝仍然不够,才真的进入"选区 → 摘要 → 替换"的循环,而且这个循环有 `compactionRetries` 次重试上限——因为一次摘要可能因为原文太长导致摘要本身也超出预期,这时会再选一段范围重新压缩,直到测量结果降到阈值以下或者重试次数耗尽；**耗尽仍未达标时会抛出错误**,由前面 `agent/pre-step` 监听器里的 `catch` 降级为一条警告日志后继续放行对话,压缩失败不阻塞正常交互。
 
 ### 触发点二：agent/request-error 的被动溢出恢复
 
@@ -135,12 +140,20 @@ if (trigger === 'context-overflow') {
 **选区（selectCompactableRange）**是一个纯函数,负责决定"到底压缩哪一段":
 
 ```typescript
-// packages/compaction/compaction-basic/src/region.ts
+// packages/compaction/compaction-basic/src/region.ts（节选，省略校验与 oxlint 注释）
 export function selectCompactableRange(
   session: Session, measurement: TokenMeasurement, retainTokens: number,
-): { start: number; end: number } | null {
+): { start: SessionSeq; end: SessionSeq } | null {
   const pricedNodes = measurement.nodes
+  if (pricedNodes.length === 0) return null
+
   const surfaceNodes = session.surface.nodes
+  if (surfaceNodes.length !== pricedNodes.length
+    || surfaceNodes.some((seq, index) => seq !== pricedNodes[index]?.seq)) {
+    throw new Error('compaction: token-meter surface does not match the current session surface')
+  }
+  const firstIdx = systemHead(session, surfaceNodes[0]!) === undefined ? 0 : 1
+
   let accumulated = 0
   let keepFromIdx = pricedNodes.length
   for (let index = pricedNodes.length - 1; index >= 0; index -= 1) {
@@ -148,35 +161,41 @@ export function selectCompactableRange(
     keepFromIdx = index
     if (accumulated >= retainTokens) break
   }
-  if (keepFromIdx === 0) return null
-  while (keepFromIdx > 0) {
+  if (keepFromIdx <= firstIdx) return null
+
+  while (keepFromIdx > firstIdx) {
     if (toolPairingBalancedBefore(session, surfaceNodes[keepFromIdx]!)) break
     keepFromIdx -= 1
   }
-  if (keepFromIdx === 0) return null
-  const first = surfaceNodes[0]!
+  if (keepFromIdx <= firstIdx) return null
+
+  const first = surfaceNodes[firstIdx]!
   const cutoff = surfaceNodes[keepFromIdx - 1]!
   return { start: first, end: cutoff }
 }
 ```
 
-策略是"从尾部往前累计,凑够 `retainTokens` 就停",定下一个初步的切分点后,再往前微调到最近一个"不会切断一次工具调用/结果配对"的边界（`toolPairingBalancedBefore`）——**绝不能让压缩把一次 `tool/call` 和它对应的 `tool/result` 从中间切开**,否则派生出的历史会出现一次没有结果的裸调用,模型看到会困惑,更严重的是会破坏 provider 侧对"assistant 消息紧跟工具结果"这类格式的强约束。
+策略是"从尾部往前累计,凑够 `retainTokens` 就停",定下一个初步的切分点后,再往前微调到最近一个"不会切断一次工具调用/结果配对"的边界（`toolPairingBalancedBefore`）。入口处还多了两道硬校验：token 测量结果和当前 surface 不一致（比如测量是异步缓存的、期间发生了压缩）直接抛错,绝不在错误的前提上选区；切分下界从 `0` 改成 `firstIdx`——如果 surface 节点 0 是 `system/message` 系统头部,就绝不把它卷进压缩范围（系统提示词通常要作为 provider 侧 KV 缓存的锚点留在头部）。**绝不能让压缩把一次 `tool/call` 和它对应的 `tool/result` 从中间切开**,否则派生出的历史会出现一次没有结果的裸调用,模型看到会困惑,更严重的是会破坏 provider 侧对"assistant 消息紧跟工具结果"这类格式的强约束。
 
-**摘要（summarizeWithLlm）**是唯一需要调用模型的一步。`buildSummarizationInput()`（`region.ts`)专门负责复用会话自己的 `system` 和 `tools`：
+**摘要（summarizeWithLlm）**是唯一需要调用模型的一步。`buildSummarizationInput()`（`region.ts`)专门负责复用会话自己的系统提示词和工具 schema：
 
 ```typescript
-// packages/compaction/compaction-basic/src/region.ts
-function buildSummarizationInput(session: Session, shadowedSeqs: readonly number[]): SummarizationInput {
+// packages/compaction/compaction-basic/src/region.ts（节选，省略注释）
+function buildSummarizationInput(session: Session, shadowedSeqs: readonly SessionSeq[]): SummarizationInput {
   const header = session.requestHeader()
+  const head = systemHead(session, session.surface.nodes[0]!)
+  const system = head === undefined ? null : session.deriveEventMessage(head)
+  const regionMessages = shadowedSeqs
+    .map(seq => session.deriveEventMessage(session.eventAt(seq)!))
+    .filter((message): message is Message => message !== null)
   return {
-    ...header?.system === undefined ? {} : { system: header.system },
     ...header?.tools === undefined ? {} : { tools: header.tools },
-    messages: shadowedSeqs.map(seq => session.deriveEventMessage(events[seq]!)).filter(/* not null */),
+    messages: system === null ? regionMessages : [system, ...regionMessages],
   }
 }
 ```
 
-复用同一份 `system`/`tools` 前缀不是随意的选择——它让摘要请求在 provider 侧看起来是"同一个对话的自然延续",能够复用 provider 端的 KV 缓存（prompt caching）,而不是每次摘要都要重新处理一遍完整的系统提示词。摘要生成后还有一道安全检查：
+一个值得留意的演进：系统提示词不再从 `request/header` 里取（`EpochHeader` 已经不再携带 `system` 字段——第二篇说过,系统提示词本身就是派生历史,住在 surface 节点 0 的 `system/message` 事件里）,而是直接从 surface 头部那条 `system/message` 投影出来；工具 schema 仍然复用 header 里的。复用同一份系统提示词和工具前缀不是随意的选择——它让摘要请求在 provider 侧看起来是"同一个对话的自然延续",能够复用 provider 端的 KV 缓存（prompt caching）,而不是每次摘要都要重新处理一遍完整的系统提示词。摘要生成后还有一道安全检查：
 
 ```typescript
 // packages/compaction/compaction-basic/src/region.ts
@@ -194,7 +213,7 @@ if (framedSummaryTokenCount >= prepared.shadowedTokenCount) {
 // packages/compaction/compaction-basic/src/region.ts
 const summaryEvent = session.append('compaction/summary', { /* ... */ })
 session.append('user/message', checkpointMessage, {
-  surfaceOp: { op: 'replace', start, end },
+  surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
   sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
 })
 ```
@@ -261,7 +280,7 @@ export function apply(ctx: Context): void {
 
 ### 批量写入而不是逐事件同步落盘
 
-> **2026-09 更新**：这一层的包结构和类名相比早期版本变化不小——`packages/session/session-persistence` 现在只保留一份**存储契约**（`storage-contract.ts`/`errors.ts`/`revision.ts`：定义 `SessionHandle` 接口、约定错误类型、版本校验，不含具体实现），真正的批量写入逻辑挪到了一个具体的后端实现包 `packages/session/session-persistence-jsonl` 里，直接作为实现 `SessionHandle` 的类（`JsonlSessionHandle`，`storage.ts`）上的方法，早期版本里独立的 `PersistenceCoordinator`/`SessionWriteBehind` 这两个类已经不存在了。这是"接口与实现分离"的一次重构，为将来接入非 JSONL 的持久化后端留出了空间，但批量写入的核心机制（缓冲 + 定时器窗口 + 显式 flush 提前结清）完全没变。
+> **2026-09 更新**：这一层的包结构和类名相比早期版本变化不小——`packages/session/session-persistence` 现在只保留一份**存储契约**（`handle.ts`/`storage-contract.ts`/`errors.ts`/`revision.ts`：定义 `SessionHandle` 接口、约定错误类型、版本校验，不含具体实现），真正的批量写入逻辑挪到了一个具体的后端实现包 `packages/session/session-persistence-jsonl` 里，直接作为实现 `SessionHandle` 的类（`JsonlSessionHandle`，`storage.ts`）上的方法，早期版本里独立的 `PersistenceCoordinator`/`SessionWriteBehind` 这两个类已经不存在了。这是"接口与实现分离"的一次重构，为将来接入非 JSONL 的持久化后端留出了空间，但批量写入的核心机制（缓冲 + 定时器窗口 + 显式 flush 提前结清）完全没变。
 
 `ctx.sessions.flush()` 最终落到 `JsonlSessionHandle`（`packages/session/session-persistence-jsonl/src/storage.ts`）实例的 `enqueueLive()`/`drainLive()` 方法上。日常追加事件走的是"攒一批再写"的路径:
 
@@ -289,8 +308,8 @@ export const LIVE_WRITE_BATCH_MAX_DELAY_MS = 200
 默认的批量窗口依然是 200 毫秒（常量改了名字，数值没变）——`enqueueLive()` 只在没有定时器在跑、且没有被暂停（`drainPaused`）时才会启动一个新的定时器,窗口内到达的所有事件会被合并成一次真正的持久化写入（`drainLive()` 用 `this.draining ??= ...` 这个惯用法保证并发调用只会真正触发一次排空，其余调用者共享同一个 promise）。`flush()` 则是明确要求"现在立刻结清,不要等定时器":
 
 ```typescript
-// packages/session/session-persistence/src/write-behind.ts
-flush(session: Session): Promise<boolean> {
+// packages/core/session/src/index.ts（SessionStore.flush，节选）
+async flush(session: Session): Promise<boolean> {
   const { carrier } = this.liveEntryFor(session)
   const callbacks = collectSessionCallbacks(this.ctx, [carrier, 'session/flush', session])
   const results = await Promise.allSettled(callbacks.map(callback => callback(session)))
@@ -300,7 +319,7 @@ flush(session: Session): Promise<boolean> {
 }
 ```
 
-> **2026-09 更新**：`ctx.sessions.flush(session)`（`packages/core/session/src/index.ts`）现在的实现是向所有注册了 `'session/flush'` 的监听器**并行**派发一次调用、`Promise.allSettled` 等它们全部结束、只要有一个失败就把第一个失败原因抛出去——这是一个"多个持久化后端都可以挂一个 durability 监听器"的 fan-out 设计,取代了早期版本里"直接调用某个具体 `PersistenceCoordinator` 实例的 `flush()`"这种点对点调用。`session-persistence-jsonl` 后端正是通过 `ctx.on('session/flush', session => writer.flush())` 注册自己的监听器,内部再去调用上一节的 `drainLive()` 把缓冲的事件同步排空。
+> **2026-09 更新**：`ctx.sessions.flush(session)` 的实现就是上面这段（`packages/core/session/src/index.ts` 的 `SessionStore.flush`，早期版本这段代码在 `session-persistence` 包的 `write-behind.ts` 里，该文件已随"接口与实现分离"重构消失）——向所有注册了 `'session/flush'` 的监听器**并行**派发一次调用、`Promise.allSettled` 等它们全部结束、只要有一个失败就把第一个失败原因抛出去：这是一个"多个持久化后端都可以挂一个 durability 监听器"的 fan-out 设计,取代了更早版本里"直接调用某个具体 `PersistenceCoordinator` 实例的 `flush()`"这种点对点调用。`session-persistence-jsonl` 后端正是通过 `ctx.on('session/flush', session => writer.flush())` 注册自己的监听器,内部再去调用上一节的 `drainLive()` 把缓冲的事件同步排空。
 
 不管挂了几个监听器，语义都没变：调用 `ctx.sessions.flush()` 拿到的 `Promise` resolve,意味着此刻为止追加的所有事件都已经真正落盘（对每一个参与的持久化后端都成立),才安全地继续往下走——这正是 `session-checkpoint-policy` 三处调用所依赖的行为。这套设计让"绝大多数普通事件追加"走一条便宜的、批量摊销的路径,只有真正需要 durability 保证的那几个关键时刻才付出"立刻写入"的代价——**语义上的可靠性从不打折,但性能代价被精确限制在必须付出的地方**。
 

@@ -6,7 +6,7 @@
 
 - 理解 dsh 术语表中 `capability-seam`（能力 seam）的精确定义：Service Definition / Service Provider / Consumer 三种角色，以及"seam 是完整能力而不是某一个角色"这一关键区分。
 - 通读 `dsh-shell` 包，理解一个 Service Definition 如何用 Cordis 的抽象 `Service` 类而不是 TypeScript `interface` 来声明契约。
-- 通读 `dsh-bash-local` 与 `dsh-bash-sandbox` 两个 Provider，理解后者如何通过继承前者、只覆写 `resolve`/`run`/`start` 三个方法就叠加了沙箱能力，而无需重写进程管理逻辑。
+- 通读 `dsh-bash-local` 与 `dsh-bash-sandbox` 两个 Provider，理解后者如何通过继承前者、只覆写 `resolve`/`execute` 两个方法就叠加了沙箱能力，而无需重写进程管理逻辑。
 - 通读 `dsh-tool-bash` 这个 Consumer，理解它如何只依赖 `ctx.shell` 这一个抽象契约，完全不知道背后到底是本地执行还是沙箱执行。
 - 能够把这套三元结构类推到 `fs`、`llm`、`session-persistence`、`web` 等其他能力域，看懂 dsh 的能力地图（capability seam 全景图）。
 
@@ -55,16 +55,17 @@ export abstract class ShellExecutor extends Service {
   }
 
   abstract resolve(request: ShellExecRequest): ShellExecSpec
-  abstract run(spec: ShellExecSpec): Promise<ShellRunResult>
-  abstract start(spec: ShellExecSpec): ShellProcess
+  abstract execute(spec: ShellExecSpec): Promise<ShellExecution>
 }
 ```
 
+契约的另一半在同包的 `packages/shell/shell/src/types.ts` 里：`execute()` 的返回值 `ShellExecution` 是一个"活的进程句柄"（`ShellProcess`：`status`/`done`/`readOutput()`/`kill()`）加上一个前台投影 `result(): Promise<ShellRunResult>`。一个接口同时承载了"后台句柄"与"前台等待"两种用法，这正是新版契约最核心的一次收敛。
+
 几个设计细节值得单独说一说：
 
-- **`extends Service` 而不是纯接口**：`ShellExecutor` 是一个抽象类，`super(ctx, 'shell')` 这一行把自己注册成了 `ctx.shell`。任何 Provider 只需要 `extends ShellExecutor` 并实现三个抽象方法，就自动获得了"成为 `ctx.shell`"的资格；如果同一个 context 里同时加载了两个 Provider，Cordis 会在第二次注册时直接抛错——这是"一个 context 只能有一种执行方式"这条不变式的强制手段,不需要额外的业务代码去检查。
+- **`extends Service` 而不是纯接口**：`ShellExecutor` 是一个抽象类，`super(ctx, 'shell')` 这一行把自己注册成了 `ctx.shell`。任何 Provider 只需要 `extends ShellExecutor` 并实现两个抽象方法，就自动获得了"成为 `ctx.shell`"的资格；如果同一个 context 里同时加载了两个 Provider，Cordis 会在第二次注册时直接抛错——这是"一个 context 只能有一种执行方式"这条不变式的强制手段,不需要额外的业务代码去检查。
 - **`declare module` 声明合并**：`interface Context { shell: ShellExecutor }` 是 TypeScript 的模块扩展写法，让 `ctx.shell` 在类型系统里全局可见,同时这个契约类型永远是抽象的 `ShellExecutor`，而不是某个具体 Provider 的类型——这就是为什么下文的 Consumer 完全不需要知道背后到底是哪个 Provider。
-- **`resolve`/`run`/`start` 三个抽象方法**划出了契约的最小接口面：`resolve` 把调用方给的"请求"（`ShellExecRequest`，字段基本都是可选的）填充成一个"规范"（`ShellExecSpec`，字段基本都是必填的，超时已经被夹到配置允许的范围内）；`run` 用规范跑一次前台命令并等待结束；`start` 启动一个后台进程并立刻返回句柄。三个方法覆盖了 dsh 里"跑一条 shell 命令"所需的全部语义，不多不少。
+- **`resolve`/`execute` 两个抽象方法**划出了契约的最小接口面：`resolve` 把调用方给的"请求"（`ShellExecRequest`，字段基本都是可选的）填充成一个"规范"（`ShellExecSpec`，字段基本都是必填的，超时已经被夹到配置允许的范围内，还多了两个新字段：`onExpiry` 决定超时那一刻做什么——`'kill'`（默认）到点杀掉进程并记 `timedOut`，`'none'` 干脆不设时限——以及 `stdoutMaxBytes`，前台 stdout 的捕获预算）；`execute` 按规范准备并启动进程，返回 `ShellExecution`。早期版本里这个契约是 `resolve`/`run`/`start` 三件套（`run` 跑前台、`start` 起后台），现在收敛成了一个 `execute`——官方在源码 JSDoc 里把设计理由写得很直白：**"前台"是"等待方"的属性，不是"启动"的属性**（"Foreground is a property of what the caller awaits, not of the spawn"）：`await` 了 `execution.result()` 的调用就是前台，握着句柄只看 `status`/`readOutput()` 的就是后台，想"先等一会儿再说"的调用就用 `onExpiry: 'none'` 起命令、自己给等待设界。`result()` 只在基础设施失败时才 reject；非零退出、超时杀、外部取消杀都 resolve 成一份带 `timedOut`/`aborted` 首因分类的 `ShellRunResult`。
 - **`sandboxMode` 是一个"能力事实" getter**：默认返回 `undefined`（表示这个执行器不做沙箱隔离），子类可以覆写它。这不是一个业务功能，而是 Consumer 探测"我背后到底有没有沙箱"的观测点——后面在 `dsh-tool-bash` 里会看到它是怎么被用来决定要不要在工具 schema 里暴露 `sandbox_permissions` 参数的。
 
 契约类型本身（`ShellExecRequest`/`ShellExecSpec`/`ShellRunResult`/`ShellProcess`）定义在同包的 `packages/shell/shell/src/types.ts` 里，它们就是这个 seam 的"词汇"——Provider 和 Consumer 之间唯一允许交换的数据形状。比如 `ShellRunResult`：
@@ -94,34 +95,38 @@ export interface ShellRunResult {
 export class LocalBashExecutor extends ShellExecutor {
   static inject = ['subprocess']
 
-  static Config: z<Config> = z.object({
-    cwd: z.string(),
-    timeoutMs: z.number().default(120_000),
-    maxTimeoutMs: z.number().default(600_000),
-    maxOutputBytes: z.number().default(64_000),
-    maxSpillBytes: z.number().default(DEFAULT_MAX_SPILL_BYTES),
-    graceMs: z.number().default(DEFAULT_GRACE_MS),
+  static Config = z.object({
+    cwd: z.string().volatile(),
+    timeoutMs: z.number().default(120_000).volatile(),
+    maxTimeoutMs: z.number().default(600_000).volatile(),
+    maxOutputBytes: z.number().default(64_000).volatile(),
+    maxSpillBytes: z.number().default(DEFAULT_MAX_SPILL_BYTES).volatile(),
+    graceMs: z.number().default(DEFAULT_GRACE_MS).volatile(),
   })
 
   resolve(request: ShellExecRequest): ShellExecSpec {
     const timeoutMs = clampTimeout(
-      request.timeoutMs, this.config.timeoutMs, this.config.maxTimeoutMs,
+      request.timeoutMs, this.config.timeoutMs.get(), this.config.maxTimeoutMs.get(),
       'bash-local: request.timeoutMs',
     )
-    // ...填充 workdir、stdoutMaxBytes、env、dshEnv 等字段...
+    const stdoutMaxBytes = request.stdoutMaxBytes ?? this.config.maxOutputBytes.get()
+    return {
+      command: request.command,
+      workdir: request.workdir ?? this.config.cwd.get() ?? process.cwd(),
+      timeoutMs,
+      onExpiry: request.onExpiry ?? 'kill',
+      stdoutMaxBytes,
+      // ...可选字段(signal / stdin / env / dshEnv)原样透传...
+    }
   }
 
-  async run(spec: ShellExecSpec): Promise<ShellRunResult> {
-    return this.runArgv(spec, ['bash', '-c', spec.command])
-  }
-
-  start(spec: ShellExecSpec): ShellProcess {
-    return this.startArgv(spec, ['bash', '-c', spec.command])
+  async execute(spec: ShellExecSpec): Promise<ShellExecution> {
+    return this.executeArgv(spec, ['bash', '-c', spec.command])
   }
 }
 ```
 
-这里的关键设计是 `runArgv`/`startArgv` 被声明成 `protected` 方法，而 `run`/`start` 只是把公开的 `bash -c` argv 传给它们。这个拆分不是随手为之——它专门是为了让子类只需要替换 argv，就能复用全部进程生命周期、环境变量、输出收集、超时、abort 的机制，这正是下一个 Provider 要做的事。
+这里的关键设计是 `executeArgv` 被声明成 `protected` 方法，而公开的 `execute` 只是把 `bash -c` 这条 argv 传给它。`executeArgv` 的第二个参数不但可以是一条现成的 argv，**还可以是一个"准备函数"**（`(signal) => Promise<argv>`，签名上叫 `argvOrPrepare`）——这专门给子类"异步准备 argv"留了入口：`prepare` 函数被接进超时信号里，准备阶段超时会落成一个"已经结算好的空句柄"而不是把调用挂死。这个拆分不是随手为之——它让子类只需要替换 argv（或提供自己的准备函数），就能复用全部进程生命周期、环境变量、输出收集、熔断超时、abort 的机制，这正是下一个 Provider 要做的事。
 
 ### Provider 二：`dsh-bash-sandbox`，用继承叠加沙箱能力
 
@@ -147,19 +152,30 @@ export class SandboxBashExecutor extends LocalBashExecutor {
     return { ...super.resolve(request), sandboxPolicy: request.sandboxPolicy ?? this.ctx.sandboxPolicy.resolve() }
   }
 
-  override async run(spec: ShellExecSpec): Promise<ShellRunResult> {
+  override async execute(spec: ShellExecSpec): Promise<ShellExecution> {
     const policy = spec.sandboxPolicy as SandboxExecutionPolicy
     const { mode } = policy
     if (mode === 'danger-full-access') {
-      const result = await super.run(spec)
-      return { ...result, sandbox: { mode, denied: false } }
+      return SandboxBashExecutor.decorateResult(
+        await super.execute(spec),
+        result => ({ ...result, sandbox: { mode, denied: false } }),
+      )
     }
-    const confined = this.confine(spec.command, { ...policy, mode })
-    // ...把 confined.argv 交给继承来的 this.runArgv(spec, confined.argv)...
+    let confined: ConfinedArgv | undefined
+    const ex = await this.executeArgv(spec, async (signal) => {
+      const prepared = await this.confine(spec.command, { ...policy, mode }, signal)
+      signal.throwIfAborted()
+      confined = prepared
+      return prepared.argv
+    }, (process) => { /* ...为该进程登记沙箱事实(模式/enforcement/判定签名)... */ })
+    return SandboxBashExecutor.decorateResult(ex, (result) => {
+      if (confined === undefined) return { ...result, sandbox: { mode, denied: false } }
+      // ...runner 失败优先判定为 SANDBOX_UNAVAILABLE,否则按 stderr 签名判定 denied...
+    }, ...)
   }
 
-  private confine(command: string, policy: SandboxPolicy): ConfinedArgv {
-    return this.ctx.sandbox.confine(['bash', '-c', command], policy)
+  private confine(command: string, policy: SandboxPolicy, signal?: AbortSignal): Promise<ConfinedArgv> {
+    return this.ctx.sandbox.confine(['bash', '-c', command], policy, signal)
   }
 }
 ```
@@ -167,8 +183,9 @@ export class SandboxBashExecutor extends LocalBashExecutor {
 这段代码把"继承式扩展"这个技巧用到了极致：
 
 - `resolve()` 只做一件事——在父类填好的 spec 上补一个 `sandboxPolicy` 字段，其余全部字段的填充逻辑（超时、workdir、env）原样继承。
-- `run()` 不是重新实现整套进程管理，而是调用另一个能力 seam（`ctx.sandbox`，将在第三篇详细展开）把原始的 `['bash', '-c', command]` 包装成一个被沙箱限制过的新 argv（`confined.argv`），再把这个新 argv 交给父类继承来的 `this.runArgv`——真正的 spawn、超时、输出收集、SIGTERM/SIGKILL 升级这些机制完全没有重复代码。
-- `danger-full-access` 模式（完全放开权限）走的是最短路径：直接调 `super.run(spec)`，连 `confine` 都不调用。
+- `execute()` 不是重新实现整套进程管理，而是调用另一个能力 seam（`ctx.sandbox`，将在第三篇详细展开）把原始的 `['bash', '-c', command]` 包装成一个被沙箱限制过的新 argv（`confined.argv`），再把这个新 argv 交给父类继承来的 `this.executeArgv`——真正的 spawn、超时、输出收集、SIGTERM/SIGKILL 升级这些机制完全没有重复代码。注意 `confine` 现在是**异步**的（上游把 `SandboxProvider.confine` 改成了 `Promise<ConfinedArgv>`，并给了它一个 `signal` 参数，原因第三篇展开），所以这里不是同步拼好 argv 再传，而是把一个"准备函数"交给 `executeArgv`：准备函数在执行信号的管辖下异步跑，准备本身超时也会像普通超时一样落成一个空句柄结算。
+- 沙箱事实（这次实际跑在什么模式、stderr 里有没有出现"拒绝"签名、runner 自己的失败）通过 `decorateResult` 叠加到前台投影上：它原地改写句柄的 `result()` 方法，同时 `onProcessDone` 钩子在进程结算时把同一组事实钉到句柄的 `sandbox` 字段上——`await result()` 的前台调用方和只读句柄的后台观察者看到同一份事实。
+- `danger-full-access` 模式（完全放开权限）走的是最短路径：直接调 `super.execute(spec)`，连 `confine` 都不调用，只在前台投影上补一个 `sandbox: { mode, denied: false }` 的事实声明。
 - `sandboxMode` 这个能力事实被覆写成返回真实的默认模式，这样 Consumer 在探测 `ctx.shell.sandboxMode` 时，如果背后挂的是 `SandboxBashExecutor`，就能看到一个具体的 `SandboxMode` 而不是 `undefined`。
 
 这正是"插拔"这个词的字面含义：部署方只需要在组合配置（Cordis 的 `cordis.yml`）里把加载的插件从 `dsh-bash-local` 换成 `dsh-bash-sandbox`，`ctx.shell` 这个键背后的实现就换了，而依赖 `ctx.shell` 的所有 Consumer 代码不需要改一行。
@@ -184,41 +201,73 @@ export const inject = ['tools', 'shell', 'systemPrompt', 'shellEnv']
 
 export function apply(ctx: Context, config: Config = {}): void {
   const backgroundEnabled = config.enableRunInBackground ?? true
+  const promoteOnTimeout = (config.promoteOnTimeout ?? true) && backgroundEnabled
   const defaultMode = ctx.shell.sandboxMode
   const escalationModes: readonly SandboxMode[] = defaultMode === undefined ? [] : ESCALATION_TARGETS
   // defaultMode === undefined 时,升级参数(sandbox_permissions/justification)
   // 根本不会出现在工具 schema 里——这是运行时探测"能力事实"驱动 schema 生成的直接体现。
 
-  ctx.tools.register(defineTool({
-    name: 'bash',
-    description: bashDescription(backgroundEnabled, escalationModes),
-    parameters: {
-      command: { type: 'string', required: true, description: 'The bash command to execute.' },
-      // ...
-      ...escalationModes.length > 0 ? {
-        sandbox_permissions: { type: 'string' as const, enum: [...escalationModes], /* ... */ },
-        justification: { type: 'string' as const, /* ... */ },
-      } : {},
-    },
-    async execute(args: BashToolArgs, exec) {
-      // ...
-      const result = await ctx.shell.run(ctx.shell.resolve({
-        command: args.command,
+  ctx.systemPrompt.section({ name: 'tool:bash', order: ctx.systemPrompt.getSectionOrder('TOOL_BASH'), /* ... */ })
+
+  const bashTool = (jobs: JobRegistry | undefined): ToolDefinition =>
+    defineTool({
+      name: 'bash',
+      description: bashDescription(jobs !== undefined, escalationModes, jobs !== undefined && promoteOnTimeout),
+      parameters: {
+        command: { type: 'string', required: true, description: 'The bash command to execute.' },
         // ...
-        signal: exec.signal,
-      }))
-      // ...
-      return { kind: 'foreground' as const, ...canonicalBashResult(result) }
-    },
-  }))
+        ...escalationModes.length > 0 ? {
+          sandbox_permissions: { type: 'string' as const, enum: [...escalationModes], /* ... */ },
+          justification: { type: 'string' as const, /* ... */ },
+        } : {},
+      },
+      async execute(args: BashToolArgs, exec) {
+        // ...(审批、策略解析、workdir、dshEnv 组装成 request)...
+        if (args.run_in_background === true) {
+          // 显式后台:onExpiry: 'none' 起,直接登记成 job 并立刻返回 id
+          return { kind: 'background' as const, jobId: startJob(jobs, args, exec, ctx.shell.resolve({ ...request, onExpiry: 'none' })).id }
+        }
+        // 前台命令在启动时就注册为 job:命令从第一秒起就列出、可流式观看、可从 Web 停掉
+        if (jobs !== undefined && promote) {
+          const spec = ctx.shell.resolve({ ...request, onExpiry: 'none' })
+          let attached: StartedJob | undefined
+          try { attached = startJob(jobs, args, exec, spec) } catch { /* 注册被拒则降级为纯前台 */ }
+          if (attached !== undefined) return waitOnJob(jobs, attached, exec, spec)
+        }
+        // 没有注册表(或注册被拒)时的纯前台路径
+        const foreground = await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: exec.signal }))
+        const result = await foreground.result()
+        if (result.aborted) throw toolAborted()
+        return { kind: 'foreground' as const, ...canonicalBashResult(result) }
+      },
+    })
+
+  // 工具"有 jobs 注册表"变体与"纯前台"变体互斥互换:
+  // ctx.inject(['jobs'], ...) 在注册表进入/退出组合时原子地替换注册。
+  if (!backgroundEnabled) { ctx.tools.register(bashTool(undefined)); return }
+  let foregroundOnly = ctx.get('jobs') === undefined ? ctx.tools.register(bashTool(undefined)) : undefined
+  ctx.inject(['jobs'], (jobCtx) => {
+    foregroundOnly?.()
+    foregroundOnly = undefined
+    const unregister = ctx.tools.register(bashTool(jobCtx.jobs))
+    jobCtx.effect(() => () => { unregister(); /* 注册表卸载则回到纯前台变体 */ })
+  })
 }
 ```
 
-注意这里 `ctx.shell.resolve(...)` 和 `ctx.shell.run(...)` 两次调用,用的都是 `ShellExecutor` 抽象类上声明的方法名——`dsh-tool-bash` 这个包从头到尾 **不 import** `dsh-bash-local` 或 `dsh-bash-sandbox` 中的任何一个具体类。它甚至不知道自己此刻到底跑在本地执行器上还是沙箱执行器上,唯一能感知到差异的地方就是 `ctx.shell.sandboxMode` 这一个能力事实——如果背后换成了沙箱 Provider,`sandbox_permissions`/`justification` 这两个升级参数就会自动出现在模型看到的工具 schema 里；如果换回本地 Provider,它们就自动消失。**Consumer 的行为随 Provider 变化,但 Consumer 的代码一行都不用改**——这正是三元结构存在的意义。
+注意这里 `ctx.shell.resolve(...)` 和 `ctx.shell.execute(...)` 两个调用,用的都是 `ShellExecutor` 抽象类上声明的方法名——`dsh-tool-bash` 这个包从头到尾 **不 import** `dsh-bash-local` 或 `dsh-bash-sandbox` 中的任何一个具体类。它甚至不知道自己此刻到底跑在本地执行器上还是沙箱执行器上,唯一能感知到差异的地方就是 `ctx.shell.sandboxMode` 这一个能力事实——如果背后换成了沙箱 Provider,`sandbox_permissions`/`justification` 这两个升级参数就会自动出现在模型看到的工具 schema 里；如果换回本地 Provider,它们就自动消失。**Consumer 的行为随 Provider 变化,但 Consumer 的代码一行都不用改**——这正是三元结构存在的意义。
+
+这个 excerpt 里最需要展开的是 `waitOnJob`：组合里只要有 `ctx.jobs` 注册表，**前台命令在启动的那一刻就被注册成 job**，调用方再通过 `registry.wait(id, timeoutMs, owner, signal)` 有界地等它——这就是那句"前台是等待的属性而不是启动的属性"在工具层的落地：命令本身在 `onExpiry: 'none'` 之下启动，没有自己的执行时限，`timeoutMs` 只约束这次**等待**。三种结局：
+
+- **等待里命令跑完了**：`registry.remove(id)` 把记录从注册表删掉（模型从头到尾没见过这个 id），返回普通的前台 `ShellRunResult`。如果命令是"从外面被杀掉的"（人在 Web 任务列表里点了停止，或有人调用了 `job_kill`），`kill` 的 reason 会塞进前台结果的 `stopped` 字段，渲染成 `[stopped: <reason>]`——模型读到的是原因而不是莫名其妙的命令失败。
+- **等待超时了命令还在跑**：不杀进程，返回 `{ kind: 'promoted', jobId, timeoutMs, output }`，渲染成 `[still running after <ms>; moved to background job <id>]` 加一段任务交接指引，并用一次**消费式读取**带上截至目前的输出——之后 `job_output` 工具恰好从断点处继续。命令继续以"它本来就是这个 job"的身份运行——不是被"提升"成另一个 job,它从启动那一刻起就是注册表里的那条记录。旧版实现里存在过一个"超时后向模型兜售提升选项"的 promotion protocol,已在评审中被否决删掉:命令没有从一种类别迁移到另一种类别,只是这一次的结果告别了等待方。这个行为可以用新配置项 `promoteOnTimeout: false` 关掉,关掉之后超时退回到"执行器自己的 deadline 到点杀进程"。
+- **调用方被取消（abort）**：把 job 杀掉再等到它结算,然后抛出 abort 错误——和纯前台路径下 signal 中止命令的语义对齐。
+
+工具自身的 `inject` 列表里**并没有** `jobs`：它对 `ctx.jobs` 的依赖是可选的——末尾那段 `ctx.inject(['jobs'], …)` 守候注册表的出现与消失,据此注册两种不同的工具定义（"有注册表"变体的描述文本里才会写超时迁移语义；"纯前台"变体则不写）。这是 Cordis 可选依赖织补（service injection watcher）的范例用法,值得记住。
 
 ### 第三个 Provider:不靠继承也能实现同一个契约
 
-`SandboxBashExecutor` 靠继承 `LocalBashExecutor` 复用了几乎全部机制,但这不是唯一的实现路径——`packages/shell/pwsh-local` 提供的 `LocalPwshExecutor` 走的是另一条路:它**不继承** `LocalBashExecutor`,而是直接 `extends ShellExecutor`,独立实现一套几乎和 `bash-local` 逐行对应、但语义细节不同的进程管理:
+`SandboxBashExecutor` 靠继承 `LocalBashExecutor` 复用了几乎全部机制,但这不是唯一的实现路径——`packages/shell/pwsh-local` 提供的 `PwshLocalExecutor` 走的是另一条路:它**不继承** `LocalBashExecutor`,而是直接 `extends ShellExecutor`,独立实现一套几乎和 `bash-local` 逐行对应、但语义细节不同的进程管理:
 
 ```typescript
 // packages/shell/pwsh-local/src/index.ts
@@ -245,7 +294,7 @@ export const ENCODING_PREAMBLE =
 
 源码注释里专门写明这是"deliberate call-for-call mirror of dsh-bash-local"(刻意逐行对照 `dsh-bash-local` 的镜像实现)——两个包甚至用 `jscpd:ignore` 注释标记了这段"重复"是有意的,而不是代码坏味道。原因很直白:`bash -c` 的字符串世界有 shell 转义规则,而 `pwsh -Command` 直接把整段文本交给 PowerShell 自己解析,两者的参数拼接、编码处理(Windows PowerShell 5.1 默认用系统代码页而非 UTF-8,所以要在命令前拼一段 `ENCODING_PREAMBLE` 显式钉住编码)、环境变量约定(`TERM=dumb` 是 POSIX 概念,pwsh 场景下没有对应物)都不一样,如果强行抽出一个共享基类,反而会把两种截然不同的执行语义硬拗成同一套接口。
 
-这个例子补上了第一个 Provider 例子留下的一个空白:**同一个 Service Definition 完全允许被互不相干的多个实现类分别满足**,继承只是"如果两个 Provider 恰好共享大量机制"时的一种优化手段,不是三元结构本身要求的关系。`ShellExecutor` 抽象类真正强制的只有 `resolve`/`run`/`start` 三个方法的签名,`LocalBashExecutor` 和 `LocalPwshExecutor` 是两条平行的实现路径,`SandboxBashExecutor` 恰好选择了在其中一条路径上做继承式叠加——三者都同等合法地满足着同一个契约。
+这个例子补上了第一个 Provider 例子留下的一个空白:**同一个 Service Definition 完全允许被互不相干的多个实现类分别满足**,继承只是"如果两个 Provider 恰好共享大量机制"时的一种优化手段,不是三元结构本身要求的关系。`ShellExecutor` 抽象类真正强制的只有 `resolve`/`execute` 两个方法的签名,`LocalBashExecutor` 和 `PwshLocalExecutor` 是两条平行的实现路径,`SandboxBashExecutor` 恰好选择了在其中一条路径上做继承式叠加——三者都同等合法地满足着同一个契约。
 
 ### 为什么这套结构能让"换实现"变成插拔
 
@@ -264,14 +313,14 @@ export const ENCODING_PREAMBLE =
 | `ctx.<key>` | Service Definition 所在包 | 已知 Provider | 典型 Consumer |
 | --- | --- | --- | --- |
 | `ctx.shell` | `packages/shell/shell` | `bash-local`、`bash-sandbox`、`pwsh-local` | `tool-bash`、`tool-pwsh` |
-| `ctx.fs` | `packages/fs/fs` | `fs-local`、`fs-sandbox`、`fs-e2b` | `tool-fs` |
+| `ctx.fs` | `packages/fs/fs` | `fs-local`、`fs-sandbox`、`fs-ssh` | `tool-fs` |
 | `ctx.llm` | `packages/llm/llm` | `llm-deepseek`、`llm-pi-ai`、`llm-replay` | `agent-loop`、`compaction-basic` |
-| `ctx.sessionPersistence` | `packages/session/session-persistence` | `session-persistence-jsonl`、`session-persistence-sqlite` | `agent-loop`、`tool-bash` |
-| `ctx.web` | `packages/web/web` | `web-search-exa`、`web-search-perplexity`、`web-fetch-http` | `tool-web` |
+| `ctx.sessionPersistence` | `packages/session/session-persistence` | `session-persistence-jsonl` | `agent-loop`、`tool-bash` |
+| `ctx.web` | `packages/web/web` | `web-search-exa`、`web-search-perplexity`、`web-search-deepseek`、`web-fetch-http` | `tool-web` |
 
 值得一提的是 `ctx.llm`——它是 Service Definition 和 Consumer 合体在同一个包里的特例:`dsh-llm` 既声明了 `ctx.llm` 这个适配器注册表的契约,又是 `agent-loop` 之外的直接消费方之一。术语表专门提到了这种情况:"角色需要独立演进时通常位于不同包,但属于同一关注点时,一个包也可以承担多个角色"——三元结构讲的是职责边界,不是物理文件数量的强制拆分。
 
-再看 `ctx.fs`:它的三个 Provider 分别对应三种完全不同的运行环境——本地文件系统(`fs-local`)、加了写入围栏的沙箱文件系统(`fs-sandbox`)、E2B 远程 microVM 里的文件系统(`fs-e2b`)。`tool-fs` 这个 Consumer 对这三者的区别一无所知,它调用的永远是 `ctx.fs.read`/`ctx.fs.editText`/`ctx.fs.write` 这几个抽象方法。这也解释了为什么部署方能够在"纯本地跑""本地但沙箱隔离""完全跑在云端 microVM"这三种形态之间自由切换——每一种形态换的都只是 Provider,`tool-fs` 包本身完全不用重新发布。
+再看 `ctx.fs`:它的三个 Provider 分别对应三种完全不同的运行环境——本地文件系统(`fs-local`)、加了写入围栏的沙箱文件系统(`fs-sandbox`)、以及"共享的 SSH 帮手进程"里的远端文件系统(`fs-ssh`,挂在 `ctx.ssh` 这条连接 seam 上,连同 `subprocess-ssh`、`sandbox-ssh` 一起,文件工具读写的就是远端 Bash 和终端看到的同一批文件)。`tool-fs` 这个 Consumer 对这三者的区别一无所知,它调用的永远是 `ctx.fs.read`/`ctx.fs.editText`/`ctx.fs.write` 这几个抽象方法。这也解释了为什么部署方能够在"纯本地跑""本地但沙箱隔离""文件操作发生在远端主机上"这三种形态之间自由切换——每一种形态换的都只是 Provider,`tool-fs` 包本身完全不用重新发布。值得一提:早期版本里还存在过跑在 E2B 云端 microVM 里的 `fs-e2b` 家族,这一整套包后来已从仓库中移除(远程执行仍是官方声明的预留能力,SSH 助手族是当前落地的远程形态)——这也从侧面演示了"三元结构允许 Provider 生灭而 Consumer 不动"的真实历史。
 
 ## 常见问题/易踩坑
 
@@ -285,7 +334,7 @@ export const ENCODING_PREAMBLE =
 
 **Q:为什么 `ShellExecSpec` 里超时字段是必填的 `timeoutMs: number`,而 `ShellExecRequest` 里是可选的 `timeoutMs?: number`?**
 
-这正是 `resolve()` 这一步存在的意义——`ShellExecRequest` 是调用方(可能不知道也不该关心具体默认值和上限)的请求形状,`ShellExecSpec` 是"已经填好一切默认值、已经把请求值夹到允许范围内"之后的规范形状。`run`/`start` 两个方法只接受 `ShellExecSpec`,从类型层面就杜绝了"忘记调用 `resolve()` 就直接执行一个字段不全的请求"这类错误——这是用 TypeScript 类型系统在编译期强制一个必须发生的运行时步骤的常见手法。
+这正是 `resolve()` 这一步存在的意义——`ShellExecRequest` 是调用方(可能不知道也不该关心具体默认值和上限)的请求形状,`ShellExecSpec` 是"已经填好一切默认值、已经把请求值夹到允许范围内"之后的规范形状。`execute()` 只接受 `ShellExecSpec`,从类型层面就杜绝了"忘记调用 `resolve()` 就直接执行一个字段不全的请求"这类错误——这是用 TypeScript 类型系统在编译期强制一个必须发生的运行时步骤的常见手法。
 
 ## 小结与思考题
 
@@ -293,5 +342,5 @@ export const ENCODING_PREAMBLE =
 
 思考题:
 
-1. `SandboxBashExecutor` 选择"继承 `LocalBashExecutor`"而不是"独立实现 `ShellExecutor` 再在内部持有一个 `LocalBashExecutor` 实例"。如果换成后一种组合式写法,`resolve`/`run`/`start` 三个方法要怎么重写?两种写法在"未来新增第三个 Provider(比如远程执行器)"时,各自会遇到什么麻烦?
+1. `SandboxBashExecutor` 选择"继承 `LocalBashExecutor`"而不是"独立实现 `ShellExecutor` 再在内部持有一个 `LocalBashExecutor` 实例"。如果换成后一种组合式写法,`resolve`/`execute` 两个方法要怎么重写?两种写法在"未来新增第三个 Provider(比如远程执行器)"时,各自会遇到什么麻烦?
 2. `ctx.shell.sandboxMode` 是一个能力事实,而不是一个配置项。如果把它做成配置项(部署方在 `cordis.yml` 里显式声明"这个部署有沙箱"),会破坏三元结构里的哪一条边界?

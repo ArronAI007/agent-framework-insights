@@ -27,7 +27,7 @@ communicates with the bundled runtime over newline-delimited JSON-RPC on stdio.
 这套子系统最近经历了一次值得专门说一句的架构收敛：**Python SDK 不再启动一个专门为它定制的、剥离过的 Cordis 应用**(这套课程更早期读到的实现是这样的),而是直接启动"和终端里敲 `dsh` 完全一样的那个可执行文件",只是多传了 `--profile sdk` 这一个参数。`python/sdk/README.md` 把这一点说得很直接：
 
 ```text
-// python/sdk/README.md:9
+// python/sdk/README.md:13
 The Python SDK has no separate application entrypoint. It launches the
 bundled `dsh` CLI with `--profile sdk`; the selected profile owns the
 JSON-RPC server, agent composition, credentials, persistence, tools, and
@@ -57,8 +57,10 @@ python/
     ├── package.json         # 纯依赖清单,现在打包的是完整的 dsh 闭包
     ├── runtime-bootstrap.mjs # pkg SEA 的唯一入口,顺带处理 Office 资源解析和沙箱子进程再入
     └── src/deepseek_harness_runtime/
-        ├── __init__.py    # 运行时路径解析
-        └── runtime/       # (gitignored,构建期注入)
+        ├── __init__.py      # 运行时路径解析(exe/node 两种载体的选择逻辑)
+        ├── _resources.py    # 打包资源的校验(缺失资源/错误平台元数据/丢失可执行权限都会拒绝)
+        ├── deepseek-harness-runtime.json  # release 元数据(bundled_package_dir() 会校验它)
+        └── runtime/         # (gitignored,构建期注入)
 ```
 
 ## 核心机制详解
@@ -90,14 +92,14 @@ python/
 `@deepseek-ai/dsh` 这个包本身就在依赖列表里——这就是"这不是一个专门的 mini app,而是把完整 CLI 连同它的所有能力一起打包"这件事在 `package.json` 层面最直接的证据。`python/sdk-runtime/README.md` 里的措辞也印证了这次收敛：
 
 ```text
-// python/sdk-runtime/README.md:5
+// python/sdk-runtime/README.md:4-6
 Platform runtime wheel for the DeepSeek Harness Python SDK. It packages the
 normal `dsh` CLI and its closed Node dependency tree into a native
 executable, so SDK use requires no system Node.js.
 ```
 
 ```text
-// python/sdk-runtime/README.md:16
+// python/sdk-runtime/README.md:30
 Both carriers execute the same `dsh` grammar and shipped profiles, including
 the standalone `sdk-minimal` tree and the full `web` profile with its
 frontend assets. The private `dsh-python-runtime-closure` manifest defines
@@ -105,7 +107,7 @@ the packaged dependency closure; there is no Python-specific Node
 application or checked-in default `cordis.yml`.
 ```
 
-"there is no Python-specific Node application"——这句话把这次架构收敛的意图说得非常清楚。JSON-RPC serving 能力本身仍然是一个具体的插件(`@deepseek-ai/dsh-sdk-jsonrpc-server`),但它现在是 `dsh` 众多可选 profile 组合里的一员,不再对应一个独立维护的构建产物。
+"there is no Python-specific Node application"——这句话把这次架构收敛的意图说得非常清楚。JSON-RPC serving 能力本身仍然是一个具体的插件(`@deepseek-ai/dsh-sdk-jsonrpc-server`),但它现在是 `dsh` 众多可选 profile 组合里的一员,不再对应一个独立维护的构建产物。另外,wheel 现在还顺带安装了一个 `dsh` 控制台命令(python/sdk-runtime/README.md:9)——它把参数转发给打包的可执行文件,要求非空的 `DSH_HOME`,绝不回退到 `~/.dsh`,方便调用方直接对这个捆绑运行时执行 `dsh plugin --profile sdk add file:...` 之类的插件管理操作。
 
 ### NDJSON-RPC 收发:独立读线程 + 每请求一个 Queue
 
@@ -483,13 +485,18 @@ from deepseek_harness import DeepSeekHarness
 
 with DeepSeekHarness(
     dsh_home="/absolute/path/to/isolated-dsh-home",
+    cwd="/absolute/path/to/workspace",
     provider="deepseek-official",
     model="deepseek-v4-flash",
+    reasoning_effort="max",
+    max_tokens=49_152,
 ) as harness:
     result = harness.run("Say hi.", session_id="example-001")
 
 print(result.final_response)
 ```
+
+`cwd` 是 Agent 的工作区(`runtime_cwd` 则独立指定子进程自身的工作目录),`provider`/`model`/可选的 `reasoning_effort`/可选的正整数 `max_tokens` 会在 JSON-RPC 初始化阶段发送;`base_url`/`api_key` 显式覆盖子进程环境里的 `DEEPSEEK_BASE_URL`/`DEEPSEEK_API_KEY`(python/sdk/README.md:33)。
 
 底层的 NDJSON-RPC 收发、session 树过滤、双向请求,全部被这一层"turn 封装"隐藏掉了;唯一不能被隐藏的,是"你必须告诉它这次用哪个 Harness home"这个显式要求。
 
@@ -509,10 +516,10 @@ const DEFAULT_NODE_RANGE = 'node24'
 const OUT_DIR = 'dist-exe'
 ```
 
-因为要打包的现在是**完整的** `dsh` 闭包,而不是当年那个几十行依赖的迷你应用,`ASSET_GLOBS`(覆盖 Cordis 运行时动态 bare-import,`pkg` 静态分析扫不到的那部分)也比早期版本长了不少,新增了 Markdown(内置 Skill 说明文档)、`.dylib`/`.dll`/`.so`/`.so.*` 这些原生库后缀：
+因为要打包的现在是**完整的** `dsh` 闭包,而不是当年那个几十行依赖的迷你应用,`ASSET_GLOBS`(覆盖 Cordis 运行时动态 bare-import,`pkg` 静态分析扫不到的那部分)也比早期版本长了不少,新增了 Markdown(内置 Skill 说明文档)、`.dylib`/`.dll`/`.so`/`.so.*` 这些原生库后缀,以及 `.wasm`、`.yaml`/`.yml`——`pkg` 同样扫不到 Web 前端的构建产物和 skill-badge 通过 `import.meta.url` 解析的图片资源,所以这两个包的路径被显式列了出来：
 
 ```ts
-// scripts/build-exe-for-python-sdk.ts:38-52(节选)
+// scripts/build-exe-for-python-sdk.ts:44-65(节选)
 const ASSET_GLOBS = [
   'package.json',
   'node_modules/**/*.js',
@@ -527,6 +534,13 @@ const ASSET_GLOBS = [
   'node_modules/**/*.node',
   'node_modules/**/*.so',
   'node_modules/**/*.so.*',
+  'node_modules/**/*.wasm',
+  'node_modules/**/*.yaml',
+  'node_modules/**/*.yml',
+  // web-app builds this path dynamically, so pkg cannot discover the static frontend.
+  'node_modules/@deepseek-ai/dsh-web-frontend/dist/**/*',
+  // skill-badge resolves both Markdown and image resources through import.meta.url.
+  'node_modules/@deepseek-ai/dsh-skill-badge/assets/**/*',
 ]
 ```
 
@@ -546,7 +560,7 @@ const ASSET_GLOBS = [
 `hatch_build.py` 里的自定义构建钩子依然会校验"这个平台目录下的文件,跟 `platforms.json` 声明的一致",并把 wheel 的 tag 强制设成平台专属值(而不是纯 Python 包默认的 `py3-none-any`)——这部分核心逻辑没变,只是随着文件其余部分变长挪到了新的行号：
 
 ```python
-# python/sdk-runtime/hatch_build.py:112-114(节选)
+# python/sdk-runtime/hatch_build.py:119-121(节选)
 build_data["pure_python"] = False
 build_data["infer_tag"] = False
 build_data["tag"] = f"py3-none-{platform_tag}"
@@ -555,14 +569,18 @@ build_data["tag"] = f"py3-none-{platform_tag}"
 真正新增的行李,是每个平台包现在还额外要求一个 `<可执行文件名去掉扩展名>-office/` 目录——这是完整安装好的 LibreOffice/Office 转换引擎及其依赖:
 
 ```text
-// python/sdk-runtime/README.md:11
+// python/sdk-runtime/README.md:13
 Each target also requires `<executable-stem>-office/`, where the stem
 excludes `.exe`. This directory contains the complete installed Office
-packages and their dependencies... Copy this directory together with the
-executable.
+packages and their dependencies, preserving engine resources, manifests,
+licenses, source inventories, and helper permissions. Copy this directory
+together with the executable. A missing target engine fails the sidecar
+build with its npm package name and target platform/architecture.
 ```
 
-以及 Linux/macOS 平台包附带的 `-rg`(ripgrep)可执行文件、macOS 平台包附带的 `-spawn-helper`(`node-pty` 需要)。这些都是"完整 dsh CLI 现在自带的能力"(文件全文搜索用 ripgrep,文档处理用 Office 转换引擎)在单文件打包这个环节必须一起背上的行李——这也是为什么这一节的标题从"打包成 exe"变成了"打包成 exe,顺带背了哪些行李":当年打包一个迷你 JSON-RPC demo 应用不需要考虑这些,但打包完整 CLI 就必须考虑。
+以及 ripgrep 和 PTY helper 这两个 sidecar——注意现在 Linux/macOS wheel 附带 `-rg`、Windows wheel 附带 `-rg.exe`、macOS 另外附带 `-spawn-helper`(`node-pty` 需要;README.md:11)。这些都是"完整 dsh CLI 现在自带的能力"(文件全文搜索用 ripgrep,文档处理用 Office 转换引擎)在单文件打包这个环节必须一起背上的行李——这也是为什么这一节的标题从"打包成 exe"变成了"打包成 exe,顺带背了哪些行李":当年打包一个迷你 JSON-RPC demo 应用不需要考虑这些,但打包完整 CLI 就必须考虑。
+
+行李的最新一层和 Office Skill 直接相关:每个 wheel 现在还附带 `<平台>-<架构>/primary-runtime/`(一个随包分发的 CPython 和锁定版本的 Office Python 库)和相邻的 `office-skills/`(三个默认工作流及其共享 checker;README.md:15)。这批是普通可搬迁文件,而不是嵌进 exe 字节里的资源——打包和安装期查找都会拒绝缺失的资源、错误平台的元数据、丢失的 Python 可执行权限。配套地,打包好的 bootstrap 会提供 `DSH_BUNDLED_PRIMARY_RUNTIME` 作为载体默认值(README.md:17):`sdk` profile 在 `DSH_PRIMARY_RUNTIME` 未设置时使用它,显式路径会覆盖它,空字符串则禁用查询和 Office provider——SDK 就地使用这个 Python,不会把它拷进 `DSH_HOME`。
 
 `ENTRY_BIN`(`runtime-bootstrap.mjs`)是 pkg SEA 产物真正的唯一入口——它很短,主要做两件和这次打包方式强相关的事:把 Office 相关的 `import` 解析重定向到可执行文件旁边那个真实存在的 `-office/` 目录(SEA 产物内部是虚拟文件系统,Office 转换引擎需要 spawn 出真实子进程和真实文件路径,不能只活在虚拟文件系统里);以及在检测到自己被当作沙箱 ACL runner 或 PTC runtime 子进程重新拉起时,直接切换角色执行对应的入口逻辑,而不是重新走一遍完整的 CLI 启动流程。
 
@@ -571,21 +589,28 @@ executable.
 生产环境永远走 exe,但仓库贡献者在开发调试时可能想直接跑未编译的 TS 源码。`resolve_bundled_launch_args` 依然用"显式参数 > 环境变量 > 自动只选 exe"的优先级来处理,核心安全边界没变：
 
 ```python
-# python/sdk-runtime/src/deepseek_harness_runtime/__init__.py:110-130(节选)
+# python/sdk-runtime/src/deepseek_harness_runtime/__init__.py:114-136(节选)
 def resolve_bundled_launch_args(mode: str | None = None) -> tuple[str, ...]:
-    """
+    """The argv tuple that launches the bundled runtime.
+
     Mode selection: the explicit ``mode`` argument wins, then the
     ``DSH_RUNTIME_MODE`` environment variable (``exe`` | ``node``), then
     automatic resolution. Automatic resolution finds the production exe ONLY —
     the dev-only node carrier must be selected explicitly so a production
-    deployment can never silently ride on a source build.
+    deployment can never silently ride on a source build. Returns
+    ``(exe_path,)`` in exe mode and ``(node_path, bin_js_path)`` in node mode;
+    raises FileNotFoundError when the selected carrier is unavailable and
+    ValueError for an unknown mode value.
     """
     selected = mode if mode is not None else os.environ.get(RUNTIME_MODE_ENV_VAR)
     if selected is None or selected == "exe":
         return (str(bundled_runtime_path()),)
     if selected == "node":
         return _node_launch_args()
-    raise ValueError(f"unsupported DeepSeek Harness runtime mode {selected!r}: expected 'exe' or 'node'")
+    raise ValueError(
+        f"unsupported DeepSeek Harness runtime mode {selected!r}: expected 'exe' or 'node' "
+        f"(explicit argument or ${RUNTIME_MODE_ENV_VAR})"
+    )
 ```
 
 不过贡献者切到源码模式的具体方式已经变了。当年的文档给出的是"直接用 `tsx` 跑 `packages/examples/jsonrpc-demo/src/bin.ts`"这条路径——那个包和它所在的整条目录都已经被删除了(先重命名成 `packages/sdk/python-runtime`,后来又被整个移除,提交信息是"remove the private direct-config carrier")。现在 `python/development.md` 给出的两条路径是：

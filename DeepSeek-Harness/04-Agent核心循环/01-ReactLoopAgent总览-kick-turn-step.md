@@ -89,7 +89,7 @@ inject(input: UserMessage): void {
 // packages/core/agent-loop/src/agent.ts
 private wakeDriver(wakeAfterAbort = false): void {
   if (this.phase.kind !== 'idle') {
-    const reason = this.phase.abort.signal.reason as AgentCancelCause | undefined
+    const reason = abortedCancelCause(this.phase.abort.signal)
     if (reason?.kind !== 'disposed' && (this.phase.kind === 'maintenance' || wakeAfterAbort)) {
       this.phase.wakeRequested = true
     }
@@ -128,8 +128,11 @@ type Phase =
 ### turn()：一次用户可见交互的边界
 
 ```typescript
-// packages/core/agent-loop/src/agent.ts（节选，省略部分注释）
+// packages/core/agent-loop/src/agent.ts（节选，省略部分注释与重复的 signal.throwIfAborted() 检查）
 private async turn(): Promise<boolean> {
+  if (this.phase.kind !== 'running') {
+    this.throwError(new Error(`agent "${this.id}": turn without driver reservation`))
+  }
   const phase = this.phase
   const { signal } = phase.abort
   const turn = phase.turn + 1
@@ -153,10 +156,7 @@ private async turn(): Promise<boolean> {
       this.session.append('step/start', { turn, step })
       phase.step = step
       try {
-        for (const message of decision.messages) {
-          this.session.append('user/message', message, { surfaceOp: 'append' })
-        }
-        const stepEnd = await this.step(decision.assembly)
+        const stepEnd = await this.step(decision)
         if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
       } finally {
         this.session.append('step/end', { turn, step })
@@ -193,8 +193,10 @@ turn 的异常收尾同样值得一读：
 ```typescript
 // packages/core/agent-loop/src/agent.ts
 } catch (error: unknown) {
-  if (signal.aborted) {
-    turnEnds = { kind: 'aborted', reason: signal.reason as AgentCancelCause }
+  // A cause is present exactly while the signal is aborted.
+  const cause = abortedCancelCause(signal)
+  if (cause !== undefined) {
+    turnEnds = { kind: 'aborted', reason: cause }
     throw error
   }
   turnEnds = {
@@ -207,7 +209,9 @@ turn 的异常收尾同样值得一读：
 }
 ```
 
-`TurnEndReason` 是一个 merge-extensible 的判别联合（定义在 `packages/core/session/src/types.ts` 的 `TurnEndReasonMap` 里，下一篇详细展开），涵盖 `completed`/`aborted`/`blocked`/`error`/`max-tokens`/`interrupted` 六种收尾方式——每一种都对应一类可以事后重放、审计的真实原因，而不是笼统的"成功/失败"。
+这里读取消原因用的是 `abortedCancelCause()` 而不是直接 `signal.reason as AgentCancelCause`——这是取消原因归一化（上游 PR #4770 方向）的具体落点：它只拷贝 `turn/end` 真正会记录的那几个字段，因为 Node 的 `fetch` 会往 abort 原因对象上挂一个 `stack` 属性，原样传给 `Session.append()` 要么会被日志拒收、要么会把不可序列化的东西写进持久化数据。
+
+`TurnEndReason` 是一个 merge-extensible 的判别联合（定义在 `packages/core/session/src/types.ts` 的 `TurnEndReasonMap` 里，下一篇详细展开），涵盖 `completed`/`aborted`/`blocked`/`error`/`max-tokens`/`interrupted`/`forked` 七种收尾方式——其中 `forked` 不是运行中的循环会产生的：它是 fork 种子构造时给"源会话在 fork 边界处还没收尾的 turn"事后补记的标记，只出现在 fork 出来的子会话日志里。另外 `aborted` 携带的 `reason` 类型是 `TurnEndCancelCause`（= `AgentCancelCause` 加上一个 `{ kind: 'legacy' }`，专门容纳那些历史导入、当年根本没有记录取消原因的旧日志）。每一种收尾都对应一类可以事后重放、审计的真实原因，而不是笼统的"成功/失败"。
 
 ### preStep()：认领消息、组装上下文、可被拦截
 
@@ -236,7 +240,7 @@ private async preStep(target: InboxTarget, position: { turn: number; step: numbe
 
 ### step()：一次模型调用与它触发的工具执行
 
-> **2026-09 更新**：`step()` 的签名和内部实现相比早期版本有明显演进——参数从裸的 `assembly: PromptAssembly` 变成了 `preStep()` 返回的完整 `decision`（携带 `messages`/`assembly`/`startsRequestSeries`），流式消费也从"直接用 `BlockAssembler` 边落盘边组装"重构成了通过 `AssistantStreamAttempt` 这个专门的封装类来做（细节见下一篇《流式输出管道》）。下面按当前 `packages/core/agent-loop/src/agent.ts` 的真实实现讲解，不再是早期版本的简化骨架。
+> **2026-09 更新**：`step()` 的签名和内部实现相比早期版本有明显演进——参数从裸的 `assembly: PromptAssembly` 变成了 `preStep()` 返回的完整 `decision`（携带 `messages`/`assembly`/`startsRequestSeries`）；这一步要处理的用户消息落盘（`user/message`）也从 `turn()` 挪进了 `step()` 内部、只在 `firstAttempt` 时写一次，保证请求失败重试不会在日志里重复记录同一条用户消息；流式消费则从"直接用 `BlockAssembler` 边落盘边组装"重构成了通过 `AssistantStreamAttempt` 这个专门的封装类来做（细节见下一篇《流式输出管道》）。下面按当前 `packages/core/agent-loop/src/agent.ts` 的真实实现讲解，不再是早期版本的简化骨架。
 
 ```typescript
 // packages/core/agent-loop/src/agent.ts（节选，省略请求重试与系统提示词落盘部分）
@@ -250,7 +254,8 @@ private async step(decision: Extract<PreparedStep, { kind: 'enter' }>): Promise<
   let firstAttempt = true
   while (true) {
     const { config, preparedCall } = await this.prepareRequest(turn, step, signal)
-    // ... 系统提示词/用户消息落盘（略，和早期版本语义一致）
+    // ... 系统提示词经 SystemPromptProjection 投影成 system/message 事件落盘；
+    // 本步的用户消息也在这里落盘，但只在 firstAttempt 时各写一次（重试不重复写）
     const request = this.buildRequest(config, preparedCall, assembly.tools, /* ... */)
     const live = new AssistantStreamAttempt(
       this.session.id, ++this.assistantAttemptCounter,

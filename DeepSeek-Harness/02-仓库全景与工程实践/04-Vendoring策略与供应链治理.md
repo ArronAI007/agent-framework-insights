@@ -1,12 +1,12 @@
 # Vendoring 策略与供应链治理
 
-> 大多数项目对上游框架的态度是"通过 npm 依赖引入,信任维护者,等版本发布再升级";DeepSeek Harness 对 Cordis 框架及其生态选择了完全相反的路径——把源码原样拷进仓库、改名到自己的 scope 下、连本地补丁清单都逐条记录在案。这不是"重新发明轮子",而是一次关于可审计性、可控性与升级节奏的工程权衡。本篇读 `vendor/README.md` 原文,拆解 `pnpm-workspace.yaml` 里 `overrides` + `linkWorkspacePackages` 如何把这套 vendoring 落到依赖解析层面,并讲清楚 `verify-vendored-links` 这类治理脚本存在的意义。
+> 大多数项目对上游框架的态度是"通过 npm 依赖引入,信任维护者,等版本发布再升级";DeepSeek Harness 对 Cordis 框架及其生态选择了完全相反的路径——把源码原样拷进仓库、改名到自己的 scope 下、连本地补丁清单都逐条记录在案。这不是"重新发明轮子",而是一次关于可审计性、可控性与升级节奏的工程权衡。本篇读 `vendor/README.md` 原文,拆解统一使用 `workspace:^` 协议声明 + `pnpm-workspace.yaml` 的 `overrides` 如何把这套 vendoring 落到依赖解析层面,并讲清楚 `verify-vendored-links` 这类治理脚本存在的意义。
 
 ## 学习目标
 
 - 理解"source-vendored"策略解决的具体问题,以及它相对于"npm 依赖 + lockfile 锁版本"这条更常见路径多付出的成本和多换来的控制力。
 - 读懂 `vendor/README.md` 里的 manifest 表格结构:目录、npm 包名、上游名、版本、上游仓库、commit hash 五元组分别在治理什么。
-- 理解 `pnpm-workspace.yaml` 里 `linkWorkspacePackages: true` 配合 `overrides` 字段如何让"上游 semver 范围"精确解析到"仓库内被锁定的本地源码"。
+- 理解仓库内统一的 `workspace:^` 协议声明配合 `pnpm-workspace.yaml` 的 `overrides` 字段,如何让"上游 semver 语义的范围"精确解析到"仓库内被锁定的本地源码"。
 - 读懂 `scripts/verify-vendored-links.ts` 是怎么用 `pnpm-lock.yaml` 的内容反向验证"没有任何一个 vendored 包偷偷从 registry 装了一份副本"的。
 - 建立"vendoring"作为一种工程决策模式的普适认知,知道在什么场景下这个成本值得付。
 
@@ -26,11 +26,11 @@ DeepSeek Harness 选择的中间路径是**把上游源码原样拷进仓库**�
 
 > This directory contains source-vendored copies of the Cordis framework and its foundation libraries. They are copied into this monorepo instead of being depended on via npm, so that the harness fully owns its framework layer (auditable, patchable, pinned).
 
-紧接着解释了为什么要**改名到 `@deepseek-ai` scope**——这不是品牌洁癖,而是发布安全的考量:
+紧接着陈述了**改名到 `@deepseek-ai` scope** 这个事实,以及版本记录的分工——manifest 表格记的是上游版本与 commit,而每个 vendored 包自己的 `package.json` 携带的是 Harness 发布版本(在这份文档写作时是 cordis 4.0.3、cosmokit 1.8.4、schemastery 3.18.3 等,随每次 vendor release 整体推进):
 
-> All vendored packages are renamed into the `@deepseek-ai` scope (`cordis` → `@deepseek-ai/cordis`, `@cordisjs/plugin-<x>` → `@deepseek-ai/cordis-plugin-<x>`): every harness package declares `cordis` as a peer dependency, so publishing the harness publishes this framework layer too, and a publication under the upstream names would squat them on the registry.
+> All vendored packages use the **`@deepseek-ai` scope** (`cordis` → `@deepseek-ai/cordis`, `@cordisjs/plugin-<x>` → `@deepseek-ai/cordis-plugin-<x>`). The manifest table records upstream versions and source commits; each package manifest carries its Harness release version and publication metadata. Repository-owned runtime dependencies use `workspace:^`, so local builds resolve the pinned workspace packages and publication substitutes release ranges.
 
-也就是说:harness 的每个包都把 `cordis` 声明成 peer dependency,一旦发布,这份 vendored 框架层也会跟着一起发布出去;如果不改名,直接用上游的包名发布,就等于在公共 registry 上"抢注"了别人的包名——这是必须避免的供应链事故。
+改名的理由(README 早期版本曾直接写明"不改名会在 registry 上 squat 上游包名",现在的正文只陈述事实,但机制没有变):harness 的每个包都把 `cordis` 声明成 peer dependency——实测当前 307 个叶子包的 `peerDependencies` 里都有 `@deepseek-ai/cordis`,值统一是 `workspace:^`——一旦发布,这份 vendored 框架层也会跟着一起发布出去;如果不改名,直接用上游的包名发布,就等于在公共 registry 上"抢注"了别人的包名——这是必须避免的供应链事故。
 
 Manifest 表格本身是治理的核心数据结构,九个 vendored 包的每一行都精确记录五个维度:
 
@@ -64,20 +64,19 @@ Manifest 表格本身是治理的核心数据结构,九个 vendored 包的每一
 
 ### `pnpm-workspace.yaml`:把策略落到依赖解析层面
 
-策略声明本身不会自动生效,真正让"vendored 源码取代 npm 副本"这件事在依赖解析层面成立的,是根 `pnpm-workspace.yaml` 里两处配合:
+策略声明本身不会自动生效,真正让"vendored 源码取代 npm 副本"这件事在依赖解析层面成立的,现在靠两层配合:仓库内所有 manifest 对 vendored 名字的引用统一使用 `workspace:^` 协议(包括全部 307 个叶子包对 `@deepseek-ai/cordis` 的 peer dependency 声明),外加根 `pnpm-workspace.yaml` 里的 `overrides`:
 
 ```yaml
-# pnpm-workspace.yaml
-# Vendored framework packages keep their upstream semver ranges, while local
-# builds must resolve those matching names to this workspace's pinned sources.
-linkWorkspacePackages: true
-
+# pnpm-workspace.yaml（当前版本,已实测核对）
 overrides:
+  'extract-zip>yauzl': '3.4.0'
   '@deepseek-ai/cosmokit': 'link:vendor/cosmokit'
   '@deepseek-ai/schemastery': 'link:vendor/schemastery'
 ```
 
-`linkWorkspacePackages: true` 让 pnpm 优先把满足 semver 范围的依赖解析到 workspace 内的本地包,而不是去 registry 找。`overrides` 则是更强的一层保证——直接把 `@deepseek-ai/cosmokit`、`@deepseek-ai/schemastery` 这两个名字**无条件**重写成 `link:vendor/cosmokit`、`link:vendor/schemastery`,不管声明它们的地方写的 semver 范围是什么。注释里说得很直白:"vendored 框架包保留上游的 semver 范围写法,但本地构建必须把匹配这些名字的依赖解析到这个 workspace 内被钉死的源码"——也就是说,哪怕某个包的 `package.json` 里写着 `"@deepseek-ai/cordis": "^4.0.0-rc.7"` 这样看起来像是指向 npm registry 的版本范围,pnpm 实际解析出来的永远是 `vendor/cordis` 目录下的那份被钉死的源码,不存在"网络另一端某个发布者悄悄推送新版本"的风险。
+（原先的 `linkWorkspacePackages: true` 开关和"Vendored framework packages keep their upstream semver ranges..."那行注释在当前版本里已经移除——`workspace:^` 协议声明取代了对这个开关的依赖;`vendor/README.md` 里那句"Repository-owned runtime dependencies use `workspace:^`, so local builds resolve the pinned workspace packages and publication substitutes release ranges"说的正是这套机制:本地构建直接用 workspace 内的钉死源码,发布时再把协议替换成真正的 semver 范围。）
+
+`overrides` 则是更强的一层保证——直接把 `@deepseek-ai/cosmokit`、`@deepseek-ai/schemastery` 这两个名字**无条件**重写成 `link:vendor/cosmokit`、`link:vendor/schemastery`,不管声明它们的地方写的是什么版本范围——这层主要兜住的是 vendor 包之间仍按上游 semver 写法互相引用的那些边。也就是说,哪怕某处声明看起来像是指向 npm registry 的版本范围,pnpm 实际解析出来的永远是 `vendor/` 目录下的那份被钉死的源码,不存在"网络另一端某个发布者悄悄推送新版本"的风险。
 
 `vendor/README.md` 里还提到一个容易被忽略的细节:Schemastery 的 `package.json` 额外声明了条件 `exports`(import → `.mjs`,require → `.cjs`),原因是 pnpm 链接的是目录本身,如果没有这份 `exports` 声明,Node 的 ESM 解析器会退回读 `main` 字段从而加载 CJS 入口,而 CJS 入口里的惰性 `require('@deepseek-ai/cosmokit')` 在 vitest 这类会做模块钩子的宿主环境下,可能和 ESM 加载同一个被链接模块产生竞态。这说明"link 到本地目录"本身也带来了新的、需要专门处理的边界情况,不是简单地把 npm 依赖换成本地路径就万事大吉。
 
@@ -91,7 +90,7 @@ overrides:
 "hygiene": "tsx scripts/run-gates.ts hygiene",
 ```
 
-`scripts/run-gates.ts` 里 `hygiene` 模式展开的具体检查项列表里(`rescope-vendor:check`、`publint`、`constraints`、`verify-package-dependencies`、`verify-dsh-package-licenses`、`verify-package-invariants`、`verify-node-next-types`、`verify-cordis-config`、`verify-runtime-closure` 等),没有再找到 `verify-vendored-links` 或明显的同名替代脚本。最接近的、依然存在且承担相关职责的是 `scripts/check-vendor-manifest.sh`(lefthook pre-commit 里的"vendor manifest guard",职责是"改了 `vendor/*/src` 却没同步更新 `vendor/README.md` 就拒绝提交",这和"lockfile 有没有偷偷解析出 registry 副本"是两件不同的事)以及 `rescope-vendor:check`(验证改名一致性)。**这是一个老实报告的发现,而不是猜测出来的替代关系**——如果这个具体的 lockfile 反向校验能力被移除了,那意味着"vendored 包被悄悄从 registry 装了一份副本"这类问题现在依赖 `linkWorkspacePackages: true`+`overrides` 本身的正确性,以及人工审查 `pnpm-lock.yaml` 的 diff,不再有一道自动化门禁专门盯着这件事;读者如果关心这一点,建议直接在自己本地的仓库副本里搜索确认现状,而不要直接采信这里的结论。
+`scripts/run-gates.ts` 里 `hygiene` 模式展开的具体检查项列表里(`rescope-vendor:check`、`publint`、`constraints`、`verify-package-dependencies`、`verify-dsh-package-licenses`、`verify-package-invariants`、`verify-node-next-types`、`verify-cordis-config`、`verify-runtime-closure` 等),没有再找到 `verify-vendored-links` 或明显的同名替代脚本。最接近的、依然存在且承担相关职责的是 `scripts/check-vendor-manifest.sh`(lefthook pre-commit 里的"vendor manifest guard",职责是"改了 `vendor/*/src` 却没同步更新 `vendor/README.md` 就拒绝提交",这和"lockfile 有没有偷偷解析出 registry 副本"是两件不同的事)以及 `rescope-vendor:check`(验证改名一致性)。**这是一个老实报告的发现,而不是猜测出来的替代关系**——如果这个具体的 lockfile 反向校验能力被移除了,那意味着"vendored 包被悄悄从 registry 装了一份副本"这类问题现在依赖 `workspace:^` 协议解析 + `overrides` 本身的正确性,以及人工审查 `pnpm-lock.yaml` 的 diff,不再有一道自动化门禁专门盯着这件事;读者如果关心这一点,建议直接在自己本地的仓库副本里搜索确认现状,而不要直接采信这里的结论。
 
 ### 供应链治理的分工:AGENTS.md 里的更新流程
 
@@ -109,14 +108,17 @@ Vendoring 只覆盖了 Cordis 生态这一类"完全拥有"的框架层依赖。
 
 ```yaml
 # pnpm-workspace.yaml（当前版本;node-pty 的补丁版本号从 1.1.0 涨到了 1.2.0-beta.15,
-# 同时多了两条专门为 Electron 桌面应用打包链路服务的新补丁）
+# 补丁总数也从课程写作时的一条涨到了六条）
 patchedDependencies:
+  '@earendil-works/pi-ai@0.85.1': patches/@earendil-works__pi-ai@0.85.1.patch
   '@electron/osx-sign@1.3.3': patches/@electron__osx-sign@1.3.3.patch
+  '@fortune-sheet/core@1.0.4': patches/@fortune-sheet__core@1.0.4.patch
+  '@fortune-sheet/react@1.0.4': patches/@fortune-sheet__react@1.0.4.patch
   '@yao-pkg/pkg@6.21.0': patches/@yao-pkg__pkg@6.21.0.patch
   node-pty@1.2.0-beta.15: patches/node-pty@1.2.0-beta.15.patch
 ```
 
-`@electron/osx-sign` 和 `@yao-pkg/pkg` 这两条新补丁,几乎可以肯定是伴随第 01 篇提到的 `apps/desktop` Electron 桌面应用一起出现的——前者是 macOS 应用签名工具,后者是把 Node 应用打包成单文件可执行体的工具,都属于"桌面/可执行体分发链路"这一类新增的构建需求。
+`@electron/osx-sign` 和 `@yao-pkg/pkg` 这两条是伴随第 01 篇提到的 `apps/desktop` Electron 桌面应用一起出现的——前者是 macOS 应用签名工具,后者是把 Node 应用打包成单文件可执行体的工具,都属于"桌面/可执行体分发链路"这一类新增的构建需求。再往后又陆续新增了三条:`@earendil-works/pi-ai`(`llm-pi-ai` 所用的可选 LLM API 后端库,补丁去掉了流式 tool-call 增量 JSON 的重复解析)和 `@fortune-sheet/core` / `@fortune-sheet/react`(Web 端 XLSX 工作簿预览所用的电子表格组件,前者修复 HTML 单元格转义)。
 
 `patches/node-pty@1.2.0-beta.15.patch` 里的真实内容,还是给 PTY 后端的 spawn-helper 路径解析加一个可覆盖的环境变量出口,核心逻辑和课程写作时基本一致,只是版本号跟着 node-pty 本身的升级往前挪了一格,注释里还新增了一句直接点名意图的说明("A current external embedded-runtime consumer supplies a non-sibling helper"——这句新注释同样在暗示 Electron 桌面这个新增消费者):
 
@@ -189,7 +191,7 @@ recorded in [`vendor/README.md`](vendor/README.md).
 
 - **误以为改一份 `vendor/cordis/src/*.ts` 就完事**——`vendor/README.md` 要求任何偏离上游都要同步补一条"Local modifications"记录并说明理由,否则下一次同步上游代码时,这条本地改动很可能被直接覆盖丢失。
 - **给 vendored 包加新依赖时忘记它们的 `devDependencies`/`scripts`/`repository` 字段是被特意精简过的**——README 第 2 条修改记录明确写了"removed upstream devDependencies/scripts/repository fields",随手抄一份上游 `package.json` 覆盖回去会破坏这份精简约定。
-- **以为 `overrides` 只在直接依赖层生效**——`linkWorkspacePackages` + `overrides` 的组合对**任何深度**的依赖图都生效,包括从已构建的 `lib/` 产物里发出的 import,这也是 `verify-vendored-links` 要检查 `packages`/`snapshots` 这类深层 lockfile 结构、而不只是检查顶层 `importers` 的原因。
+- **以为 `overrides` 只在直接依赖层生效**——`workspace:^` 协议解析 + `overrides` 的组合对**任何深度**的依赖图都生效,包括从已构建的 `lib/` 产物里发出的 import,这也是当年 `verify-vendored-links` 要检查 `packages`/`snapshots` 这类深层 lockfile 结构、而不只是检查顶层 `importers` 的原因。
 
 ## 小结与更普适的认知
 

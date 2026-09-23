@@ -8,7 +8,7 @@
 
 - 理解 `StreamChunk` 这个协议无关的中间表示长什么样，以及 Provider 的 adapter 实现如何把 SSE 字节流转换成它。
 - 理解 `LlmRuntime` 的 `'llm/stream'` waterfall 中间件链的作用——它是插件（比如下一篇的 checkpoint 策略）介入"模型请求即将发出"这一时刻的唯一入口。
-- 通读 `BlockAssembler` 的真实实现，理解它如何把碎片化的 `block-start`/`text-delta`/`tool-call-delta`/`block-end` 等六种 chunk 类型，增量组装成完整的 `ContentBlock[]`。
+- 通读 `BlockAssembler` 的真实实现，理解它如何把碎片化的 `block-start`/`text-delta`/`tool-call-delta`/`block-end` 等七种 chunk 类型，增量组装成完整的 `ContentBlock[]`。
 - 理解 `AssistantStreamAttempt` + `AssistantStreamAccumulator` 这套新机制：为什么现在不再是"每个原始 chunk 都落一条日志"，而是把连续的同类 delta 压缩成"紧凑记录"、只落一条 `assistant/message`/`assistant/attempt` 事件，同时依然保证可以**无损**还原出原始的逐 chunk 时间序列。
 - 理解实时 UI 更新（`AssistantStreamFrame` 的 `start`/`chunk`/`end`）和"落盘供回放"这两件事现在是彻底分离的两条路径，不再像早期版本那样共用同一条日志。
 
@@ -27,61 +27,60 @@
 
 ### 第一层 Provider → Adapter：把 SSE 字节流转换成 StreamChunk
 
-> `DeepSeekAdapter` 现在按协议形态拆成了两套实现（`packages/llm/llm-deepseek/src/protocols/chat-completions/` 和 `.../protocols/messages/`，分别对应两种不同的 API 报文形态），`DeepSeekAdapter.stream()` 只是一层转发：`stream(options) { return this.implementation().stream(options) }`。下面仍以最常用的 `chat-completions` 协议路径为例，核心的 `parseSse` 解析逻辑没有变化，只是文件搬到了协议专属目录下。
+> **2026-09 更新**：`packages/llm/llm-deepseek` 的目录形态又变了一次——之前按协议形态拆出来的 `src/protocols/chat-completions/`、`src/protocols/messages/` 两层目录已经不存在，包重新回到了扁平结构，而且 DeepSeek 侧现在只保留一套 **Messages 协议**实现（Anthropic 风格的 `message_start`/`content_block_delta`/`message_stop` 事件流，请求发往 `${baseURL}/messages`）。`DeepSeekAdapter.stream()` 依然只是一层转发：`stream(options) { return this.generate(options, this.dependencies.options()) }`，真正的流式逻辑在私有的 `generate()` 里。
 
-`packages/llm/llm-deepseek/src/protocols/chat-completions/sse.ts` 里的 `parseSse()` 负责把裸的 SSE 字节流解析成 DeepSeek 协议的原始文本负载：
+`packages/llm/llm-deepseek/src/sse.ts` 里的 `parseSse()` 负责把裸的 SSE 字节流解析成 DeepSeek Messages 协议的事件对象：
 
 ```typescript
-// packages/llm/llm-deepseek/src/protocols/chat-completions/sse.ts
-export async function* parseSse(
-  stream: ReadableStream<BufferSource>,
-  onComment?: (comment: string) => void,
-): AsyncGenerator<string> {
-  const events = stream
-    .pipeThrough(new TextDecoderStream())
-    .pipeThrough(new EventSourceParserStream({ onComment }))
-  for await (const { data } of events) {
-    yield data
-    if (data === DONE) return
+// packages/llm/llm-deepseek/src/sse.ts
+export async function* parseSse(body: ReadableStream<BufferSource>, activity: () => void): AsyncGenerator<Record<string, unknown>> {
+  const events = body.pipeThrough(new TextDecoderStream()).pipeThrough(new EventSourceParserStream({ onComment: activity }))
+  for await (const frame of events) {
+    activity()
+    let raw: unknown
+    try { raw = JSON.parse(frame.data) } catch (_invalidSseJson) {
+      throw new LlmError('DeepSeek Messages SSE contains invalid JSON', 'MALFORMED_RESPONSE')
+    }
+    const event = object(raw)
+    if (typeof event.type !== 'string' || (frame.event !== undefined && frame.event !== event.type)) {
+      throw new LlmError('DeepSeek Messages SSE event type mismatch', 'MALFORMED_RESPONSE')
+    }
+    if (event.type === 'error') throw providerError(event, undefined)
+    yield event
   }
-  throw new LlmError('SSE stream ended without [DONE]', 'STREAM_CLOSED')
 }
 ```
 
-注意它把"帧重组"（分块可能在任意字节边界断开，甚至断在一个 UTF-8 多字节字符中间）完全委托给了 `eventsource-parser` 这个第三方库，自己只保留了一条 DeepSeek 协议特有的规则：**必须显式收到 `[DONE]` 才算流正常结束**，如果 EOF 之前没看到它，说明响应被截断，直接 `throw` 一个 `LlmError('STREAM_CLOSED')`——这是"流看起来正常结束、但其实是网络层面被截断"这类隐蔽故障的第一道防线。
+它仍然把"帧重组"（分块可能在任意字节边界断开，甚至断在一个 UTF-8 多字节字符中间）完全委托给 `eventsource-parser` 这个第三方库，但职责比早期版本多了一层协议级校验：每一帧解析成 JSON 之后，必须携带字符串类型的 `type` 字段、且与 SSE 的 `event:` 行一致，否则抛 `MALFORMED_RESPONSE`；`type === 'error'` 的帧直接转成结构化 provider 错误抛出。第二个参数 `activity` 是一个心跳回调（每收到一帧就调一次），专门用来喂下面要讲的空闲看门狗。早期版本那条"必须显式收到 `[DONE]` 才算流正常结束"的规则没有消失，而是随协议迁移换了形态：现在它体现在 `translate()`（`packages/llm/llm-deepseek/src/translate.ts`）的出口处——`for await` 正常跑完都没见到 `message_stop` 事件，就 `throw new LlmError('DeepSeek Messages stream ended before message_stop', 'STREAM_CLOSED')`。"流看起来正常结束、但其实是网络层面被截断"这类隐蔽故障的第一道防线还在，只是判据从 `[DONE]` 哨兵文本换成了 Messages 协议的终止事件。
 
-再往上一层，`DeepSeekAdapter` 的 `chat-completions` 协议实现（`packages/llm/llm-deepseek/src/protocols/chat-completions/adapter.ts`）把这些原始 payload 经过 `translate()` 转换成协议无关的 `StreamChunk`，并且套了一层空闲超时看门狗：
+再往上一层，`DeepSeekAdapter` 的 `generate()`（`packages/llm/llm-deepseek/src/adapter.ts`）把 `parseSse()` 产出的事件流喂给 `translate()` 转换成协议无关的 `StreamChunk`（`yield* translate(parseSse(response.body, activity), options.model)`），并且套了一层空闲超时看门狗：
 
 ```typescript
-// packages/llm/llm-deepseek/src/protocols/chat-completions/adapter.ts（节选，早期版本这段逻辑在顶层 adapter.ts，现在下沉到协议实现里）
-async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-  const connection = this.config.options()
-  const apiKey = await this.config.resolveApiKey(connection)
+// packages/llm/llm-deepseek/src/adapter.ts（节选）
+private async * generate(options: GenerateOptions, connection: Connection): AsyncGenerator<StreamChunk> {
   const consumer = new AbortController()
-  const upstream = options.signal === undefined ? consumer.signal : AbortSignal.any([options.signal, consumer.signal])
-  using watchdog = idleWatchdog(upstream, connection.streamIdleTimeoutMs, STREAM_IDLE_TIMEOUT_CODE)
-  const iterator = this.request(options, watchdog.signal, connection, apiKey, userId, () => { watchdog.pulse() })[Symbol.asyncIterator]()
+  const signal = options.signal === undefined ? consumer.signal : AbortSignal.any([consumer.signal, options.signal])
+  using watchdog = idleWatchdog(signal, connection.streamIdleTimeoutMs, 'MESSAGES_IDLE')
+  const iterator = this.request(options, connection, watchdog.signal, () => { watchdog.pulse() })
   try {
     while (true) {
-      const result = await watchdog.next(iterator)
-      if (result.done) { exhausted = true; return }
-      yield result.value
+      const next = await watchdog.next(iterator)
+      if (next.done) return
+      yield next.value
     }
-  } catch (error: unknown) {
-    if (timeoutOf(watchdog.signal, STREAM_IDLE_TIMEOUT_CODE) !== undefined) {
-      throw new LlmError(`DeepSeek stream idle timeout after ${connection.streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
-    }
-    if (options.signal?.aborted) throw new LlmError('DeepSeek request aborted by caller', 'ABORTED', { cause: error })
+  } catch (error) {
+    if (timeoutOf(watchdog.signal, 'MESSAGES_IDLE') !== undefined) throw new LlmError('DeepSeek Messages stream idle timeout', 'TIMEOUT', { cause: error })
+    if (options.signal?.aborted) throw new LlmError('DeepSeek Messages request aborted', 'ABORTED', { cause: error })
     if (error instanceof LlmError) throw error
-    throw new LlmError(`DeepSeek API stream from ${connection.baseURL} failed`, 'TRANSPORT', { cause: error })
+    throw new LlmError('DeepSeek Messages transport failed', 'TRANSPORT', { cause: error })
   } finally {
-    consumer.abort('DeepSeek stream consumer stopped')
-    if (!exhausted && iterator.return !== undefined) { try { await iterator.return() } catch {} }
+    consumer.abort()
+    try { await iterator.return(undefined) } catch { /* 请求已结束，清理失败不改变结果 */ }
   }
 }
 ```
 
-一个信号（`upstream`）同时服务两件事：调用方主动取消（`options.signal`）和空闲看门狗超时（`idleWatchdog` 内部的 `watchdog.signal`），两者用 `AbortSignal.any` 融合成一个。`catch` 块里的判断顺序也是精心设计的——先判断是不是看门狗超时（映射成 `TIMEOUT`），再判断是不是调用方主动取消（映射成 `ABORTED`），最后才是兜底的 `TRANSPORT`——这保证了同一次失败，无论真实原因是什么，最终抛出的 `LlmError` 都带着一个稳定、可被后续重试逻辑（第五篇）用来做路由判断的 `code`，而不是一段自然语言消息。
+一个信号同时服务两件事：调用方主动取消（`options.signal`）和空闲看门狗超时（`idleWatchdog` 内部的 `watchdog.signal`），两者用 `AbortSignal.any` 融合成一个。`catch` 块里的判断顺序也是精心设计的——先判断是不是看门狗超时（映射成 `TIMEOUT`），再判断是不是调用方主动取消（映射成 `ABORTED`），最后才是兜底的 `TRANSPORT`——这保证了同一次失败，无论真实原因是什么，最终抛出的 `LlmError` 都带着一个稳定、可被后续重试逻辑（第五篇）用来做路由判断的 `code`，而不是一段自然语言消息。
 
 ### 第二层 Adapter → LlmRuntime：一个可被中间件插入的 waterfall
 
@@ -282,6 +281,6 @@ case 'reasoning-delta': {
 
 ## 小结
 
-- 流式管道核心分三层：Provider 协议转换（`parseSse` + `translate`，现按协议形态拆分成 `chat-completions`/`messages` 两套实现）→ `LlmRuntime` 的 `'llm/stream'` waterfall（中间件可介入,如 checkpoint）→ Agent Loop 的 `AssistantStreamAttempt`，把"实时转发给 UI"（`AssistantStreamFrame`，不落盘）和"落盘一份可无损重放的紧凑记录"（`AssistantStreamAccumulator` 打包连续同类 delta）彻底拆成两条独立路径。Host/Client 之间具体怎么传输、怎么重连恢复，架构已经重组，详见第 06 章。
+- 流式管道核心分三层：Provider 协议转换（`parseSse` + `translate`，当前 DeepSeek 侧只保留一套 Messages 协议实现，包回到扁平目录）→ `LlmRuntime` 的 `'llm/stream'` waterfall（中间件可介入,如 checkpoint）→ Agent Loop 的 `AssistantStreamAttempt`，把"实时转发给 UI"（`AssistantStreamFrame`，不落盘）和"落盘一份可无损重放的紧凑记录"（`AssistantStreamAccumulator` 打包连续同类 delta）彻底拆成两条独立路径。Host/Client 之间具体怎么传输、怎么重连恢复，架构已经重组，详见第 06 章。
 - `BlockAssembler` 按内容块 `index` 维护增量组装状态,`block-end` 到达即钉死,之后的迟到 delta 被忽略;`max-tokens` 截断时会把不完整的工具调用块整体过滤掉。
 - 落盘的紧凑记录（`AssistantStreamRecord[]`）通过打包连续同类 delta 大幅降低日志体量，同时用 `expandAssistantStream()`/`assembleAssistantStream()` 保证依然可以无损还原出原始的逐 chunk 时间序列——不是"用存储换保真度"的取舍，而是同一份保真度换了一种更省空间的编码方式。

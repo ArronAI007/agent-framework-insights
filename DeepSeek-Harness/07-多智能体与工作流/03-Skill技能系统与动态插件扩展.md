@@ -1,6 +1,6 @@
 # Skill 技能系统与动态插件扩展
 
-> 一套技能库越丰富,越容易在不知不觉间把每个 skill 的完整说明全塞进 system prompt,喂给模型的 token 越滚越大。dsh 的 Skill 系统把这个问题拆成两层:一份轻量的"名字 + 一句话描述"目录随会话常驻,完整的操作说明只在模型明确点名要用某个 skill 时才被加载进来。本篇前半讲这套"按需展开上下文"的技能系统,后半讲一个走得更远的能力——`packages/extensions` 里的 Cordis 动态插件机制,模型可以在运行时自己写一段 JS、定义一个全新的 Cordis 插件挂载到宿主进程里,也就是所谓"自我扩展"。这个能力默认不随标准配置启用,本篇会把源码里能找到的风险边界原样摆出来。
+> 一套技能库越丰富,越容易在不知不觉间把每个 skill 的完整说明全塞进 system prompt,喂给模型的 token 越滚越大。dsh 的 Skill 系统把这个问题拆成两层:一份轻量的"名字 + 一句话描述"目录随会话常驻,完整的操作说明只在模型明确点名要用某个 skill 时才被加载进来。本篇前半讲这套"按需展开上下文"的技能系统,后半讲一个走得更远的能力——`packages/extensions` 里的 Cordis 插件机制:模型在工作区里写一个插件包,再用 `plugin_manager` 把它持久安装进当前 Profile,从而给宿主进程加上一件新能力,也就是所谓"自我扩展"。这个能力默认不随标准配置启用,本篇会把源码里能找到的风险边界原样摆出来。
 
 ## 学习目标
 
@@ -8,13 +8,13 @@
 - 读懂内置的 `skill-badge`(最小示例)和 `skill-filesystem`(真实的磁盘发现 + 文件监听引擎)两个 Provider 的实现差异。
 - 弄清 `tool-skill` 工具如何把"模型可调用的加载动作"和"随会话注入的技能目录消息"分成两条独立路径,以及目录消息为什么要做摘要长度截断和内容摘要去重。
 - 把 Skill 系统的"按需加载正文"与第四篇讲过的上下文压缩做类比,理解两者都是"控制喂给模型的上下文体量"的手段,只是压缩针对的是历史,按需加载针对的是待选知识。
-- 理解 Cordis 动态插件扩展(`cordis_define`/`cordis_run`)的能力边界:model 写的插件代码到底能碰到什么、guard/sandbox 挡住了什么、又刻意没有挡住什么,以及这套能力为什么被隔离在一个非默认的 Agent Preset 里。
+- 理解 Cordis 动态插件扩展在当前版本的能力边界与形态变化:模型侧的"生成代码"工具(`cordis_define`/`cordis_run`/`cordis_stop`/`cordis_undefine`)已经被整体撤掉,`tool-cordis` 缩编为两个**只读自省**工具,自我扩展改走"工作区里写插件包 + `plugin_manager install_bundle` 持久安装到 Profile"这条路;在此基础上弄清 `vm`/`guard` 挡住了什么、又刻意没有挡住什么,以及这套能力为什么仍然被隔离在一个非默认的 Agent Preset 里。
 
 ## 背景与设计动机
 
 Skill 系统和 Cordis 动态插件系统表面上离得很远,但放在一起讲是因为它们回答的是同一个更大问题的两端:**一个 Agent 的能力边界,应该在启动时就固定死,还是可以在运行过程中动态调整?**
 
-Skill 系统给出的答案是"温和版"的动态——技能的**内容**在运行时按需加载,但技能能做的事(读文件、生成徽章之类)早就被写成了静态的 Markdown 说明,模型只是"学会怎么用现有工具去完成一件事",并没有获得任何新的执行能力。Cordis 动态插件给出的是"彻底版"的动态——模型可以在运行时定义一段全新的、真正会被求值执行的 JavaScript,挂载成一个能访问宿主服务的插件,相当于给自己造了一件新工具。前者几乎没有额外的信任风险,后者的信任模型等价于给了 shell 访问权限——这也是为什么它被单独隔离在一个不常驻的预设里,而不是随手可用的默认能力。
+Skill 系统给出的答案是"温和版"的动态——技能的**内容**在运行时按需加载,但技能能做的事(读文件、生成徽章之类)早就被写成了静态的 Markdown 说明,模型只是"学会怎么用现有工具去完成一件事",并没有获得任何新的执行能力。Cordis 插件给出的是"彻底版"的动态——模型写出一段全新的、真正会被求值执行的 JavaScript,装成宿主进程里能访问真实服务的插件,相当于给自己造了一件新工具(当前版本的具体路径是"工作区写包 + `plugin_manager` 持久安装",见下文)。前者几乎没有额外的信任风险,后者的信任模型等价于给了 shell 访问权限——这也是为什么它被单独隔离在一个不常驻的预设里,而不是随手可用的默认能力。
 
 ## Skill 技能系统
 
@@ -136,22 +136,47 @@ function renderCatalogMessage(entries: SkillCatalogSource['entries']): UserMessa
 
 ## 动态插件自举:Cordis 自我扩展能力
 
-### `tool-cordis`:七件套自省与自举工具
+这一半相对课程写作时发生了实质性变化,先把结论放在最前面:**模型侧那套"生成代码"型工具已经整体撤掉,自我扩展改走了另一条路**——Agent 把插件包写成普通的工作区文件,再调用 `plugin_manager` 工具把它持久安装到当前 Profile;而"动态定义请求"(`code: { host?, client? }`)这套底层机制并没有拆,只是它的消费方从模型工具换成了面板类 / 程序化调用方。下面按"现在模型手里有什么 → 还在的底层机制 → 风险边界 → 预设打包方式"的顺序,讲当前版本的全貌。
 
-`packages/extensions/tool-cordis/src/index.ts` 里注册了七个工具,名字都是 `cordis_` 前缀:
+### `tool-cordis`:从"七件套"缩编为两个只读自省工具
+
+课程写作时,`packages/extensions/tool-cordis/src/index.ts` 里注册了七个 `cordis_` 前缀的工具——既有自省工具,也有 `cordis_define`/`cordis_run`/`cordis_stop`/`cordis_undefine` 四个直接改写运行时的"生成代码"工具。**当前版本里,留给模型的只剩两个只读工具**,模块头注释写得很直接("Read-only Host and Client runtime API discovery for plugin development"),注入的服务也只剩 `['tools', 'cordisInspect']`:
 
 ```typescript
-// packages/extensions/tool-cordis/src/index.ts(工具名一览)
-// cordis_inspect_list   — 列出当前动态挂载的插件
-// cordis_inspect_query  — 查询某个插件/服务的细节
-// cordis_inspect_self   — 自省当前会话自己的组合状态
-// cordis_define         — 定义一个新插件(或更新已有插件)
-// cordis_run            — 让某个已定义的插件在指定作用域挂载运行
-// cordis_stop           — 停掉一个正在运行的插件
-// cordis_undefine       — 删除一个插件定义
+// packages/extensions/tool-cordis/src/index.ts(当前全部工具)
+// cordis_inspect_list   — 列出 Host 当前已知的全部 Cordis Inspect Provider
+//                         (含浏览器页面上同步过来的 Client manifest),带各 Provider 的
+//                         平台、用途、只读方法清单和输入/输出 Schema
+// cordis_inspect_query  — 按"平台(host/client)+ Provider + 方法"精确读取 Service 方法签名、
+//                         Event 模式、插件 Config 的 JSON Schema、Tool 参数模式、
+//                         主题 token、实时 Slot 树和 props
 ```
 
-`cordis_define` 的输入是一个 `code: { host?: string, client?: string }` 字段——**这是一段纯 JavaScript 源码字符串**(一个隐式的 async 函数体),不是某种预先设计好的插件描述 JSON。这段代码求值后必须返回一个满足 Cordis "插件"形态的值,判定逻辑在 `cordis-host-runner/src/guard.ts`:
+`cordis_inspect_list` 的 description 里有一句警告值得原样转述:"Do not guess names or treat an Inspect method as a business Service that Plugin code can call."——这些 Provider 只负责"让你看清楚宿主有哪些 API 可用";`cordis_inspect_query` 自己的 description 也把边界钉死了:"This Tool cannot invoke business Service methods or modify the runtime." 换句话说,模型现在能做"写插件前的侦察",不能通过工具会话发起任何运行时的定义、挂载、停止或删除。仓库里两份状态为 implemented 的设计笔记把这次撤编写得很直白——`.agents/notes/implemented/architecture/2026-09-16-creator-persistent-plugin-management.md`:"The model sees two read-only Cordis inspection tools. Generated-code define/run/stop/undefine and dynamic self-inspection tool APIs are absent."(课程写作时还有的第三个自省工具 `cordis_inspect_self`,也随着"看自己的行为"这一元能力被要求消失而撤掉了);更早一份 `.agents/notes/implemented/feature/2026-07-08-self-referential-cordis-toolset.md`:"Shipped model tools do not create or mutate runner definitions."
+
+### 没拆的底层:`DynamicCordisDefineRequest` 与 `guard.ts`
+
+模型会话发起 define 这条路没了,但底层那套"动态定义"机制还在原地——`DynamicCordisRunnerService`(`packages/extensions/cordis-host-runner/src/index.ts:129`)依旧暴露 `define()` 等四个操作,它的输入契约也还没变(`packages/extensions/cordis-host-runner/src/registry.ts:85-98`):
+
+```typescript
+// packages/extensions/cordis-host-runner/src/registry.ts:85-98
+export interface DynamicCordisDefineRequest {
+  /** Session that owns the plugin. */
+  sessionId: SessionId
+  /** Create a plugin or append to an existing one. */
+  plugin:
+    | { kind: 'new'; idPrefix: string }
+    | { kind: 'existing'; pluginId: CordisDynamicPluginId }
+  /** Package label. */
+  name: string
+  /** User-facing purpose. */
+  purpose: string
+  /** At least one source half. */
+  code: { host?: string; client?: string }
+}
+```
+
+`code` 字段仍然是一段**纯 JavaScript 源码字符串**(一个隐式的 async 函数体),求值后必须返回一个满足 Cordis "插件"形态的值,判定逻辑一字未动:
 
 ```typescript
 // packages/extensions/cordis-host-runner/src/guard.ts:790-794
@@ -162,26 +187,30 @@ export function isPlugin(value: unknown): value is Plugin {
 }
 ```
 
-也就是说,模型写的代码可以返回一个函数,或者一个带 `apply(ctx)` 方法的对象——这正是 Cordis 框架里普通静态插件的形态(`docs/cordis-primer.md` 里解释 Cordis 是"插件 = Service、Context = 服务仓库、`inject` 声明依赖"的元框架)。一段典型的模型写的插件正文大致是:
+也就是说,动态代码可以返回一个函数,或者一个带 `apply(ctx)` 方法的对象——这正是 Cordis 框架里普通静态插件的形态(`docs/cordis-primer.md` 里解释 Cordis 是"插件 = Service、Context = 服务仓库、`inject` 声明依赖"的元框架)。一条典型的动态插件正文,和静态插件长得一模一样:
 
 ```javascript
-// 摘自内置技能 cordis-plugin-development/SKILL.md 里给模型的示例
+// 摘自内置技能 cordis-plugin-development 的模板 templates/decoration/client.js(节选)
+// ——该技能当前教模型用"工作区写插件包 + plugin_manager install_bundle"的方式产出这类文件
 return {
-	inject: ['requiredService'],
+	inject: ['slots'],
 	apply(ctx) {
-		ctx.requiredService.someMethod()
+		ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({ /* ... */ }, Decoration))
 	},
 }
 ```
 
-换句话说,`cordis_define` + `cordis_run` 让模型可以在一次对话里,自己写一个 Cordis 插件、自己声明它要依赖哪些服务、自己把它挂到活的运行时上——这正是"动态插件自举"字面意义上的实现:插件不是部署时写死在 `cordis.yml` 里的,而是模型在运行期临时定义出来的。
+换句话说,`DynamicCordisRunnerService.define()` 仍能让一段临时代码自己声明要依赖哪些服务、自己挂到活的运行时上——"动态插件自举"的机制层面没有变,变的是**谁能发起一次 define**:课程写作时是模型的一次工具调用,当前是面板操作(`ui-cordis` 的控制面板)或程序化调用方的 API 调用——`ui-cordis` 的 README 现在写得很明确:用户侧新创建的插件走 Plugin Manager,这个包只负责渲染历史上那些"生成插件"的卡片、并对进程内定义提供控制面板,"this package exposes no model mutation tools"。模型真正要走的扩展新路,是后面"预设"一节要讲的 Plugin Manager。
 
 ### 沙箱与守卫:`guard.ts`/`sandbox.ts` 到底挡住了什么
 
-`cordis-host-runner/src/sandbox.ts` 用 `node:vm` 给模型写的代码建了一个执行环境,但源码文档从一开始就明确否认了这是安全边界。真正挡住的是一组会诱导误用的 Node 全局量——不是删除,而是替换成"抛出教学性错误"的陷阱:
+`cordis-host-runner/src/sandbox.ts` 用 `node:vm` 给动态定义的代码建了一个执行环境,但源码从一开始就明确否认了这是安全边界。真正挡住的是一组会诱导误用的 Node 全局量——不是删除,而是替换成"抛出教学性错误"的陷阱:
 
 ```typescript
-// packages/extensions/cordis-host-runner/src/sandbox.ts:96-108(节选逻辑)
+// packages/extensions/cordis-host-runner/src/sandbox.ts:56-59,68-79(节选与注释)
+const TIMER_REDIRECT = 'Node timers are unavailable. Use the cordis timer service instead...'
+// 只有函数型全局量会被陷阱替换;
+// 像 `process` 这样的数据型全局量干脆留空,因为抛错的访问器会引爆常见的 `typeof process` 特性探测。
 const NODE_API_REDIRECTS: Record<string, string> = {
 	require: 'Node modules are unavailable. Use the cordis services on ctx instead...',
 	setTimeout: TIMER_REDIRECT, setInterval: TIMER_REDIRECT, setImmediate: TIMER_REDIRECT,
@@ -194,47 +223,63 @@ const NODE_API_REDIRECTS: Record<string, string> = {
 
 `guard.ts` 是另一层——一个白名单式的 `ctx` 访问代理,同样明确写着"不是安全边界"。它允许的 `ctx` 方法被限制在一个固定集合(`effect`/`on`/`once`/`provide`/`timeout`/`interval`/`setTimeout`/`setInterval`/`throttle`/`debounce`),未声明的服务读取会抛出带教学意味的错误,任何写操作一律被拒绝("sandbox ctx 是只读的")。其中一条反逃逸规则值得单独一提:**任何服务方法如果返回值本身是一个活的 Cordis `Context` 对象,会被直接拒绝**——这是专门防止"模型写的代码通过某个服务方法拿到一个未经代理的、完整权限的 Context 引用,从而绕开整套 guard"的路径。跨越这条边界传递的数据必须是无损的纯 JSON,类实例、函数、`Map`/`Set`、`Date`、嵌套 `undefined` 都会被明确拒绝并给出具体错误信息。
 
-把这些机制放在一起看,`tool-cordis` 相关的四处不同源码位置(工具自身的提示词文案、`sandbox.ts`、浏览器端对应的 `client/guard.ts`、以及一份提案阶段的架构设计笔记)**都独立地写下了同一句话的不同表述**——"这是防误用的门槛,不是能挡住恶意代码的安全边界"。工具自身注入给模型的提示词原文:
+把这些机制放在一起看,"这不是安全边界"这个声明在当前版本里仍然原样立在两处源码里——`packages/extensions/cordis-host-runner/README.md`:"The sandbox isolates globals but is not a security boundary ... Treat a dynamic package like bash access";以及 `packages/extensions/cordis-client-runner/src/client/guard.ts` 头注释:"This is API discipline, not a security boundary: a dynamic package's code is as trusted as the host process that accepted its definition." 课程写作时引用的另外两处证据已经随版本变动:工具自身注入给模型的那段提示词(当时的 `cordis_define` 提示词,原文 "The restricted execution environment prevents accidental misuse; it is not a security boundary for malicious code.")随模型工具的撤编一起没了;而那份当时还处于 proposed 状态的架构设计笔记,已经转正到 `.agents/notes/implemented/` 目录下,它和宿主侧的 README 现在交叉引用——`2026-07-08-self-referential-cordis-toolset.md` 确认的口径依然是"防误用的门槛,不是能挡住恶意代码的安全边界",并且明确说 vm"is not a security boundary"。
 
-> "The restricted execution environment prevents accidental misuse; it is not a security boundary for malicious code. Services obtained by dynamic code connect to the real runtime."
-
-真正能拿到的能力边界,由插件自己声明的 `inject` 列表决定,而不是由沙箱去裁剪——一个插件完全可以声明依赖 `fs`/`bash`/`subprocess`/`pty`/`web` 这类具备真实主机权限的服务,一旦声明了依赖,拿到的就是真实的服务对象,不是阉割版。此外,课程写作时动态定义的插件只存在于一个进程内内存态的 `Map` 里,没有任何持久化——进程重启,所有动态对象全部消失。**这一点在当前版本可能已经不完全成立**(见下文关于 Plugin Manager 的说明),读者不应再把"重启即消失"当成默认可依赖的安全假设。
+真正能拿到的能力边界,由插件自己声明的 `inject` 列表决定,而不是由沙箱去裁剪——一个插件完全可以声明依赖 `fs`/`bash`/`subprocess`/`pty`/`web` 这类具备真实主机权限的服务,一旦声明了依赖,拿到的就是真实的服务对象,不是阉割版。另一个课程写作时的结论也到期了:当时动态定义的插件只活在一个进程内的内存 `Map` 里,进程重启全部消失——**现在由面板/程序化消费者发起的动态定义依旧进程内易失,但模型改走 Plugin Manager 安装出来的插件,是持久写进 Profile 的**(细节见下文"预设"一节),读者不应再把"重启即消失"当成可依赖的安全假设。
 
 ### `cordis-client-runner` 与 `ui-cordis`:浏览器侧的另一半,更弱的隔离
 
-`cordis_define` 的 `code` 参数其实分 `host`/`client` 两份源码——`host` 那份跑在 Node 侧的 `cordis-host-runner` 里(上一节讲的 `vm` + `guard` 组合),`client` 那份则跑在浏览器页面里,由 `cordis-client-runner` 负责。`packages/extensions/cordis-client-runner/src/index.ts` 本身只是一个 9 行的空壳,真正的执行逻辑在浏览器端的 `client/*.ts` 文件里——因为浏览器环境里根本没有 `node:vm` 可用,它退而用 `new Function(...)` 构造函数来跑模型写的代码。这是一种**明显更弱**的隔离:`new Function` 构造出的代码仍然运行在同一个 JS 现实(realm)里,只是形参列表可以拿掉一部分自由变量的直接可见性,并不像 `vm.createContext` 那样有一个真正独立的全局对象。浏览器端的 `client/guard.ts` 对此毫不讳言:"这是 API 层面的自律,不是安全边界——一段动态包的代码,可信程度等同于接受了它定义请求的宿主进程本身。"
+动态定义请求的 `code` 参数其实分 `host`/`client` 两份源码——`host` 那份跑在 Node 侧的 `cordis-host-runner` 里(上一节讲的 `vm` + `guard` 组合),`client` 那份则跑在浏览器页面里,由 `cordis-client-runner` 负责。`packages/extensions/cordis-client-runner/src/index.ts` 本身只是一个 9 行的空壳,真正的执行逻辑在浏览器端的 `client/*.ts` 文件里——因为浏览器环境里根本没有 `node:vm` 可用,它退而用 `new Function(...)` 构造函数来跑动态代码(`packages/extensions/cordis-client-runner/src/client/evaluator.ts:180`)。这是一种**明显更弱**的隔离:`new Function` 构造出的代码仍然运行在同一个 JS 现实(realm)里,只是形参列表可以拿掉一部分自由变量的直接可见性,并不像 `vm.createContext` 那样有一个真正独立的全局对象。浏览器端的 `client/guard.ts` 对此毫不讳言:"This is API discipline, not a security boundary: a dynamic package's code is as trusted as the host process that accepted its definition."
 
-`packages/extensions/ui-cordis` 提供的是配套的人机交互外壳——一个"Cordis 面板",展示已定义的插件、提供审批/拒绝/运行/停止/移除的操作按钮,以及给工具调用卡片(`cordis_define`/`cordis_run`)配的可视化展示,还有一个 `@插件id` 的提及(mention)输入源方便在对话里引用某个已定义的插件。需要强调的是:这层 UI 只是"审批和观察动态插件"的外壳,并不是给动态插件本身提供渲染能力的框架——插件内部要不要有界面、界面长什么样,是插件自己 `client` 代码的事,`ui-cordis` 管的是"人怎么看见、怎么批准这件事在发生"。
+`packages/extensions/ui-cordis` 提供的是配套的人机交互外壳,当前 README 的定位是:"renders historical generated-plugin cards and a control panel for process-local definitions"——它仍会渲染历史会话里留下的 `cordis_define`/`cordis_run` 工具卡片(纯记录性质:名字、purpose、源码、结局,不可再操作),并为**进程内仍存活的定义**提供一个控制面板:列出当前 Host 侧的全部定义(不分会话,自己会话的排前面),提供批准 / 停止 / 移除等操作按钮,行内同时显示"host 是否还在跑"和"本页是否已加载"两件事。课程写作时文档提到的 `@插件id` 提及(mention)输入源,在当前源码里已经找不到;新的一套用户创作路径(Agent 自己写插件的"Creator"自我扩展)改由 Plugin Manager 承担,README 原话:"New Creator plugins use Plugin Manager ... this package exposes no model mutation tools." 需要强调的是:这层 UI 只是"审批和观察动态插件"的外壳,并不是给动态插件本身提供渲染能力的框架——插件内部要不要有界面、界面长什么样,是插件自己 `client` 代码的事,`ui-cordis` 管的是"人怎么看见、怎么批准这件事在发生"。
 
-浏览器端还有一层 Host 侧没有的强制人工关卡:**Client 代码的挂载需要经过人工点击审批,Host-only 的插件则不需要**——这意味着一个只声明 Host 依赖、不带任何 Client 代码的插件,可以在模型发起 `cordis_run` 工具调用的当下就同步跑起来,没有人工审批这一步。设计笔记里也把这一点列成了值得警惕的细节:双击确认审批一次之后,同一个插件后续的所有版本更新会被预授权,不再逐次询问——这是为了不让每次小改动都要求用户重新点一次确认,但也意味着审批粒度是"插件身份",不是"这一次具体改了什么代码"。
+浏览器端仍然保留着一层 Host 侧没有的强制人工关卡:**Client 代码的挂载需要经过人工点击审批,纯 Host 定义则不需要**——`ui-cordis` README 里对纯 Host 定义的读数是"plainly running",可供操作的只有停止按钮;而一次带 Client 代码的请求会让 approvals 行停在 warning 状态,等页面用户在控制面板里点下决定。审批粒度是"插件身份"而非"这一次具体改了什么代码":审批按钮旁有一个显式勾选项("Allow future versions of this plugin"),勾选后同一插件的后续版本更新不再逐次询问——这是为了不让每次小改动都要求用户重新点一次确认,但它终究是由人勾选的选择,不是默认行为。另外,审批现在被明确设计为**页面全局(frame-wide)**:一个标签页里模型发起的请求,可以在另一个标签页的控制面板里被批准,"最先回答的那个决定生效,其余随之收敛"(README 原话 "the first answer wins and the rest converge")——这也意味着审批的责任主体是整个浏览器页面,不是某个具体会话视图。
 
-### 默认不启用:`cordis` 预设与 `standard` 预设的分野
+### 默认不启用:`cordis` 预设与持久化的 Plugin Manager
 
-这套自举能力不是随手可用的默认工具集,而是被隔离在一个专门的、非默认的 Agent Preset 里。**这份配置文件的路径已经变了**:课程写作时在 `apps/cli/config/agent-presets/cordis/agent.cordis.yml`,当前已经挪到了一个独立的 `packages/preset/agent-presets/presets/cordis/agent.cordis.yml`(连带 `minimal`/`standard` 也在同一个包下,并且多出了一个 `ptc` 预设,呼应上一篇提到的沙箱化 PTC 执行引擎)。当前文件头部的风险说明措辞也变了,而且透出一个课程写作时还没有的能力——插件不再只是"进程内内存态、重启即消失",而是多了一条**持久化到 Profile 级别**的路径:
+这套自我扩展能力不是随手可用的默认工具集,仍然被隔离在一个专门的、非默认的 Agent Preset 里。**打包方式相对课程写作时已经变样**:当时预设是 `apps/cli/config/agent-presets/cordis/agent.cordis.yml` 里的一份完整 YAML,当前已改成 `packages/bundle/web-app/presets/*.patch.yml` 里的一组"补丁文件"(patch 方言,与第三篇讲的 Profile/Bundle/Preset 装配机制一致;当前这份目录下有 `minimal`/`standard`/`ptc`/`cordis` 四份)。`packages/bundle/web-app/presets/cordis.patch.yml` 的内容很说明问题——它不再是课程写作时那样的"自包含全量配置",而是只向 web 组合之上**追加一行** `@deepseek-ai/dsh-agent-preset` 声明:
 
 ```yaml
-# TRUST: Plugin Manager installs persistent, profile-wide code that runs in the Host
-# process outside the workspace sandbox. Every call needs Full access or single-call
-# approval; granting a call does not change the session permission mode.
-# The `cordis` agent preset adds runtime inspection and persistent plugin management.
-#
-# It exists so a person can ask an agent to author another agent. Everything in
-# `standard` is here unchanged; Creator adds persistent plugin management,
-# runtime inspection, composition-authoring skills, and a persona that explains
-# where profile and preset changes belong.
+# packages/bundle/web-app/presets/cordis.patch.yml(头部注释与主体摘录)
+# Agent preset cordis: one `@deepseek-ai/dsh-agent-preset` declaration inserted
+# after the web patch. Edits saved from the Web editor override this row's
+# `config.plugins` by id from the profile patch.
+- insert:
+    - id: preset-cordis
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: cordis
+        order: 4
+        plugins:
+          # Same persona as `standard`: tool descriptions and the skill catalog carry
+          # the operating detail, and the skills own the preset-authoring rules.
+          - id: persona            # 与 standard 相同的 persona,没有"Creator 人格"
+          # ... (沿用 standard 的全部工具与命令)
+          - id: tool-cordis        # 只剩两个只读自省工具(见上文)
+          - id: skill-filesystem
+            config:
+              customSkillDirs:
+                - !!js <解析到 @deepseek-ai/dsh-agent-preset 包内的 skills/ 目录>
+                # ——即 cordis-plugin-development / editing-cordis-compositions
+                #   / cordis-composition-reference 这套"组合写作"技能
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"   # 未跑在 Profile 里则禁用
 ```
 
-> **一个未完全展开、但值得读者留意的信号**:注释里的"Plugin Manager"和"persistent, profile-wide code"这两个说法,和本节前面讲的"动态插件只活在进程内存的 `Map` 里、进程重启即消失"这个结论似乎不完全一致——这暗示当前版本可能新增了一条让已定义插件persist 到 Profile(而不只是单次会话进程)层面的路径。受限于本次核对的时间,没能把这条路径的完整实现细节读透,`cordis_define`/`cordis_run` 等七个工具的核心名字经核实仍然存在于当前源码里(`cordis_define`/`cordis_inspect_list`/`cordis_inspect_query` 均已在源码里逐一确认),但"进程重启后插件全部消失"这句话现在可能不再是全貌——如果你在实际部署里依赖这套机制的"易失性"作为一种安全假设,建议直接去读当前的 `packages/extensions/cordis-host-runner` 和相关 Plugin Manager 实现,不要只依赖本篇的旧结论。
+也就是说,当前版本的 `cordis` 预设 = `standard` 的全部内容 + 三个组合写作技能 + 只读的 `tool-cordis` + `tool-plugin-manager`,连"独立的 Creator persona"都被刻意去掉了(文件头注释原话:"Same persona as `standard`: tool descriptions and the skill catalog carry the operating detail, and the skills own the preset-authoring rules.")。课程写作时文件头部那段 `# TRUST:` 风险声明也随打包方式迁移消失了——风险声明的职责被挪到了**工具自己的 description** 上:`packages/boot/plugin-manager/src/tools.ts` 注册的 `plugin_manager` 工具的动作面是 `list_plugins`/`list_bundles`/`set_plugin`/`set_bundle`/`install_bundle`/`remove_bundle`,工具的 description 里直接写着:"Changes affect every session in this profile ... installed Host code runs outside the workspace sandbox." 而且每次调用都要过一次以 `'danger-full-access'` 为请求的逐次审批(`approveEscalation({ requestedMode: 'danger-full-access', ... })`)。
 
-而系统级的默认预设 id 被硬编码为 `standard`(`packages/bundle/web-app/cordis.patch.yml` 里的 `default: standard`),`standard` 预设本身根本不引用 `tool-cordis`/`cordis-host-runner` 这些包——也就是说,一个普通会话从"标准编码 Agent"切换到"能自己写插件改造运行时的 Agent",必须由部署方或使用者显式切换到 `cordis` 这个预设,不存在任何默认路径会不知不觉打开这扇门。这与 Skill 系统里 `skill-badge` 默认关闭是同一种谨慎——但风险等级完全不是一个量级:`skill-badge` 关闭只是少一个生成徽章的技能,而 `cordis` 预设关闭意味着"默认情况下没有任何会话具备重写自己所在运行时的能力"。
+课程核对时留下的那个"未完全展开的信号",现在可以确认落地了(`.agents/notes/implemented/architecture/2026-09-16-creator-persistent-plugin-management.md`,状态 implemented):**"Creator mode enables the existing `plugin_manager` tool. Agents author packages and Loader YAML patches as workspace files, then install them through `install_bundle`."** 对照前面"动态定义依旧进程内易失"的事实,整个故事的两头就都能说清:**由面板类 / 程序化消费者发起的动态定义,仍然是进程内内存态、重启即消失**(`2026-07-08` 笔记原话:"Definitions remain process-local. Restart and session resume do not recreate them from historical calls.");**而 Agent 自己写的、经由 `plugin_manager` `install_bundle` 装上来的宿主代码,是持久写进 Profile、对该 Profile 下每个会话都生效的**。
 
-文档层面(`docs/subsystems/extensions.md`/`.zh.md`)其实只是自动生成的 API 参考,没有展开讨论风险考量;`docs/cookbook/extension-cookbook.md` 覆盖的是普通的静态插件编写,同样没有涉及动态自举这个特性。真正的风险论述散落在源码注释、工具自身的提示词、以及一份仍处于"proposed"(尚未落地)状态的架构设计笔记里——这份笔记的原话是:"受限的执行环境不是安全沙箱……白名单和审批机制能降低误用,但不能隔离恶意代码。" 这一点值得如实告诉读者:**dsh 的正式文档目录(`docs/`)本身没有专门展开讨论这个特性的安全考量,风险边界需要读者自己去源码注释和提示词文案里拼出全貌**——本篇引用的四处"不是安全边界"的原话,就是这个拼图目前能找到的全部证据。
+而系统级的默认预设 id 仍然被硬编码为 `standard`(`packages/bundle/web-app/cordis.patch.yml:544` 的 `default: standard`,这一引用的位置没有变),`standard` 预设本身根本不引用 `tool-cordis`/`tool-plugin-manager` 这些包——也就是说,一个普通会话从"标准编码 Agent"切换到"能把插件持久安装进自己所在 Profile 的 Agent",必须由部署方或使用者显式切换到 `cordis` 这个预设,不存在任何默认路径会不知不觉打开这扇门。这与 Skill 系统里 `skill-badge` 默认关闭是同一种谨慎——但风险等级完全不是一个量级:`skill-badge` 关闭只是少一个生成徽章的技能,而 `cordis` 预设关闭意味着"默认情况下没有任何会话具备重写自己所在运行时的能力"。
+
+文档层面(`docs/subsystems/extensions.md`/`.zh.md`)仍然只是自动生成的 API 参考,没有展开讨论风险考量;`docs/cookbook/extension-cookbook.md` 覆盖的是普通的静态插件编写,同样没有涉及动态自举这个特性。课程写作时那份"proposed 状态的架构设计笔记",如今已经转正落地为两份 implemented 笔记——`2026-07-08-self-referential-cordis-toolset.md`(原文:"The vm prevents accidental global pollution; injected filesystem, shell, and network services still have real authority, so it is not a security boundary.")和 `2026-09-16-creator-persistent-plugin-management.md`(明确模型工具面只剩两个只读自省工具、写操作工具不存在、"The model sees two read-only Cordis inspection tools")。这一点值得如实告诉读者:**dsh 的正式文档目录(`docs/`)至今没有单独展开讨论这个特性的安全考量**,风险边界需要读者自己去源码注释、README 和 `.agents/notes/implemented/` 里的设计笔记拼出全貌。
 
 ## 小结
 
-Skill 系统和 Cordis 动态插件系统是同一条设计主线的两种强度:前者让模型"按需知道有哪些现成本领可用",本领本身是静态、无害的操作说明;后者让模型"按需给自己造一件新本领",新本领是真正会被执行的代码,拿到的是宿主服务的真实访问权限。`SkillProvider` 的 `list`/`get` 分离,以及 `tool-skill` 的目录消息与加载工具分离,构成了一套"廉价目录常驻、昂贵正文按需"的上下文预算控制手法,与上下文压缩是同一方法论在不同方向上的应用。Cordis 动态插件系统则老实地在四处不同的代码位置写明"这不是安全边界",把真实的能力边界交给 `inject` 声明去决定,并且用一个非默认的 Agent Preset 把这扇门锁在默认路径之外——文档本身没有展开的风险讨论,读者在真正启用这类自举能力之前需要自己把源码注释和提示词文案里的这几处声明当作唯一可信的风险说明。
+Skill 系统和 Cordis 动态插件机制是同一条设计主线的两种强度:前者让模型"按需知道有哪些现成本领可用",本领本身是静态、无害的操作说明;后者让模型"按需给自己造一件新本领",新本领是真正会被执行的代码,拿到的是宿主服务的真实访问权限。`SkillProvider` 的 `list`/`get` 分离,以及 `tool-skill` 的目录消息与加载工具分离,构成了一套"廉价目录常驻、昂贵正文按需"的上下文预算控制手法,与上下文压缩是同一方法论在不同方向上的应用。Cordis 动态插件机制在这一轮里完成了一次"收窄模型面、纯化机制层"的调整:模型侧的工具表面缩编为两个只读自省工具(`cordis_inspect_list`/`cordis_inspect_query`),自我扩展改走"工作区写插件包 + `plugin_manager install_bundle` 持久安装到 Profile"的路(带 profile 级持久化和逐次满权限审批);而底层那套"`vm` 重定向 + `guard` 白名单 + `inject` 决定能力边界"的机制原样留给面板类和程序化定义,两处源码注释依然老实写明"这不是安全边界",并且用一个非默认的 Agent Preset 把这扇门锁在默认路径之外——文档本身没有展开的风险讨论,读者在真正启用这类自举能力之前,需要自己把源码注释、README 和设计笔记里的这几处声明当作唯一可信的风险说明。
 
 思考题:
 
 1. `tool-skill` 的目录消息用摘要(SHA-256 digest)去重来避免逐轮重发,而 skill 正文选择"完全不缓存、每次现读"。如果要新增一个允许远程 HTTP 拉取的 `SkillProvider`,你会给它的 `get()` 加缓存吗?加的话,怎么在"正文可能被远程更新"和"不希望每次加载都发一次网络请求"之间取舍?
-2. `guard.ts` 里"任何返回值是活的 Context 对象就拒绝"这条反逃逸规则,和 `workflow-worker-thread` 里"跨线程边界的值必须是纯 JSON"的规则,本质上是同一类防御——不让"活的、有权限的对象"跨越一条本该受限的边界。如果你要给 Cordis 动态插件系统也加一层"遏制而非安全边界"的进程外隔离(类似第二篇提到的 `isolated-vm` 被放弃的方案),你觉得最难处理的是插件对宿主服务的"能力"访问,还是它返回值里可能夹带的"活对象引用"?
+2. `guard.ts` 里"任何返回值是活的 Context 对象就拒绝"这条反逃逸规则,和上一篇讲的 workflow 引擎里"跨进程边界的值必须是纯 JSON"的约束,本质上是同一类防御——不让"活的、有权限的对象"跨越一条本该受限的边界。如果你要给 Cordis 动态插件系统也加一层"遏制而非安全边界"的进程外隔离(类似第二篇提到的 `isolated-vm` 被放弃的方案),你觉得最难处理的是插件对宿主服务的"能力"访问,还是它返回值里可能夹带的"活对象引用"?

@@ -1,6 +1,6 @@
 # AGENTS.md 治理规范与文档体系
 
-> 根目录的 `AGENTS.md` 有一份严格的字数预算上限(当前是 1950 词,数字定义在 `scripts/doc-budgets.manifest.json` 里,课程写作时是约 1600 词),却要管住一个有 56 个工作区、几十个能力 seam 的 monorepo。它做到这一点的方式不是罗列细则,而是把每一次真实踩过的坑压缩成一条一到三行的"站规"(standing order),并把展开的道理链接到别处。本篇选出其中四条最有代表性的规则,逐条讲清楚它们各自解决的真实工程问题,再往上看一层,理解 `docs/` 目录本身的分层治理设计。
+> 根目录的 `AGENTS.md` 有一份严格的字数预算上限(当前是 1950 词,数字定义在 `scripts/doc-budgets.manifest.json` 里,课程写作时是约 1600 词),却要管住一个仅 `packages/` 下就有 307 个可发布叶子包、全仓 300 多个 pnpm 工作区、几十个能力 seam 的 monorepo。它做到这一点的方式不是罗列细则,而是把每一次真实踩过的坑压缩成一条一到三行的"站规"(standing order),并把展开的道理链接到别处。本篇选出其中四条最有代表性的规则,逐条讲清楚它们各自解决的真实工程问题,再往上看一层,理解 `docs/` 目录本身的分层治理设计。
 
 ## 学习目标
 
@@ -13,17 +13,17 @@
 
 ## 背景与设计动机
 
-`AGENTS.md` 开篇第一句就给出了整个项目的自我定位:"DeepSeek Harness is a plugin-based agent harness on vendored Cordis: **everything is a plugin**."——包括模型适配器、工具注册表、会话日志,乃至 agent loop 本身,都是可以从配置替换的插件。这种彻底的插件化架构带来一个治理难题:如果任何东西都可以被插件替换、任何贡献都可以来自任意一个包,那么"什么该做、什么不该做"就不能靠代码结构本身来约束,必须靠一份被所有贡献者(人类和 agent)都会读到的规范文档来兜底。
+`AGENTS.md` 开篇第一句就给出了整个项目的自我定位:"DeepSeek Harness is an all-plugin Cordis agent harness."——`docs/architecture.md` 把这句话展开成了它的完整含义:包括模型适配器、工具注册表、会话日志,乃至 agent loop 本身,都是可以从配置替换的插件("Every part of the product is a plugin, including the model adapter, the tool registry, the session log, and the agent loop itself, so each is replaceable from configuration")。这种彻底的插件化架构带来一个治理难题:如果任何东西都可以被插件替换、任何贡献都可以来自任意一个包,那么"什么该做、什么不该做"就不能靠代码结构本身来约束,必须靠一份被所有贡献者(人类和 agent)都会读到的规范文档来兜底。
 
-文件还有一节专门声明当前所处的阶段:
+文件紧接着的第二节("Pre-stable APIs and released Session data")声明了当前所处的阶段:
 
-> **Remove this section at the first tagged release.** With no external consumers, prefer the correct foundation over compatibility shims: rename or repackage freely and update every reference together. Backends reject old on-disk formats. SQLite uses monotonic `SCHEMA_VERSION`; `dsh-session` keeps `SESSION_FORMAT_VERSION` at `0` with no compatibility promise.
+> Public APIs are pre-stable; update every consumer. … Adjacent migration may add a version-named successor but never move, overwrite, or delete committed generations; predecessors imply neither fallback nor downgrade support. SQLite uses monotonic `SCHEMA_VERSION`.
 >
 > —— `AGENTS.md`
 
-这段"预发布立场"解释了为什么后面很多规则读起来偏向"激进求正确"而不是"保守求兼容"——因为目前没有外部消费者,任何格式、任何包名都可以在下一个 PR 里被重新设计,只要把所有引用一起改掉。这也解释了为什么规则里会出现"Backends reject old on-disk formats"这种在有外部用户的产品里几乎不可想象的表述:拒绝旧格式,而不是费力兼容它。理解这个前提,再看后面几条具体规则,会更容易理解它们为什么这样设计。
+这一节相对课程写作时那版"第一个打 tag 的发布之前,所有东西都可以随便改"的立场,把"什么还能随便改、什么已经不能随便改"切成了两半:**公开 API 仍然预稳定**,重命名、重新分包都自由,代价只是必须把所有消费方在同一个 PR 里一起改掉;但**已经随发布版本落到用户磁盘上的会话数据不再被"拒绝旧格式"对待**,而是通过相邻迁移(adjacent migration)逐版本向前搬:`packages/session/` 下的 `session-format-v0-to-v1` 到 `session-format-v3-to-v4` 每个包正好负责一步 `vN → vN+1`,已提交的历史世代永远不被移动、覆盖或删除(`SESSION_FORMAT_VERSION` 当前已经升到 4,不再是写作时那个"固定为 `0`、不作任何兼容承诺"的状态)。理解这个"代码可以激进、用户数据必须被抬着往前走"的分层前提,再看后面几条具体规则,会更容易理解它们为什么这样设计。
 
-`docs/AGENTS.md` 给出的字数预算(root `AGENTS.md` ≤ 1,600 words)进一步说明了这份文件的性质:它不是可以无限增长的知识库,而是一份被严格限定篇幅的"必须留在每次会话上下文里的规则集合"。篇幅越紧,每一条规则背后压缩掉的血泪教训就越多——接下来四条规则,值得逐条把压缩掉的部分还原出来看。
+`docs/AGENTS.md` 给出的字数目标(root `AGENTS.md` ≤ 1,950 words)进一步说明了这份文件的性质:它不是可以无限增长的知识库,而是一份被严格限定篇幅的"必须留在每次会话上下文里的规则集合"。篇幅越紧,每一条规则背后压缩掉的血泪教训就越多——接下来四条规则,值得逐条把压缩掉的部分还原出来看。
 
 ## 核心机制详解
 
@@ -57,7 +57,7 @@
 
 这条规则的完整版本写在 `docs/architecture.zh.md` 的"会话日志"一节里,措辞上更接近一句可以直接背下来的口号:
 
-> **模型可见即已记录。** 抵达模型请求的一切都必须能从日志重建,并由一项运行时不变量断言这一点。因此,新增一项模型可见输入就需要新增一个会话事件:扩展 `SessionEventMap` 并从日志渲染。
+> **模型可见即已记录。** 抵达模型请求的一切都必须能从日志重建,并由一项运行时不变量断言这一点。新增模型可见输入需要一个会话事件。修改现有消息内容的插件注册纯消息投影(pure message projection),独立读取器显式传入相同的处理器。
 >
 > —— `docs/architecture.zh.md`
 
@@ -65,11 +65,11 @@
 
 这条规则不是停留在原则层面,而是有一整套具体机制在背后强制执行它。`.agents/notes/implemented/architecture/2026-08-10-session-log-version-mechanism.md` 这份 Agent Note 记录了这套机制的设计决定,其中最直接对应"模型可见即已记录"这条规则的部分是:
 
-> 逐事件的 `ignorable` 标记吸收词汇表增长,普通的新增事件永远不用升版本。事件词汇表由挂载了哪些插件决定,单个版本整数描述不了它。读取器遇到不认识的事件类型时拒绝解读日志,除非该事件的信封带 `ignorable: true`。默认为必需:忘写标记的后果是把一个本可恢复的会话拒绝过头(体验问题),而默认可忽略会让同样的疏忽静默恢复出残缺会话(安全事故)。架构保证了这条规则成立:模型可见内容只经三种带 `surfaceOp` 标记的 surface 事件加 `request/header`、`request/context` 折叠进入重建,危险的未知事件恰好是那些不进 surface 但改变日志其余部分解读方式的事件。
+> 逐事件的 `ignorable` 标记吸收词汇表增长,普通的新增事件永远不用升版本。事件词汇表由挂载了哪些插件决定,单个版本整数描述不了它。读取器遇到不认识的事件类型时拒绝解读日志,除非该事件的信封带 `ignorable: true`。默认为必需:忘写标记的后果是把一个本可恢复的会话拒绝过头(体验问题),而默认可忽略会让同样的疏忽静默恢复出残缺会话(安全事故)。架构保证了这条规则成立:模型可见内容只经四种带 `surfaceOp` 标记的 surface 事件加 `request/header`、`request/context` 折叠进入重建,危险的未知事件恰好是那些不进 surface 但改变日志其余部分解读方式的事件(`session/end-seed` 是现存例子)。
 >
 > —— `.agents/notes/implemented/architecture/2026-08-10-session-log-version-mechanism.zh.md`
 
-这段话把"模型可见即已记录"从一句规范落实成了一个具体的默认值选择:遇到不认识的事件类型,读取器的默认行为是**拒绝**,而不是静默跳过。之所以默认拒绝而不是默认忽略,是因为这两种错误的代价完全不对称——多拒绝一次是"体验问题"(用户看到一条明确的报错,知道要升级 harness),而多忽略一次是"安全事故"(一个内容残缺的会话被静默地重建出来,用户完全不知道自己看到的历史是不完整的)。这也解释了为什么 `AGENTS.md` 里紧跟着这条规则的还有一句:"A `SessionEventMap` member is required-on-read by default … only structural format changes bump `SESSION_FORMAT_VERSION`"——版本号只在结构性变更时才递增,普通新增事件靠 `ignorable` 标记吸收,版本升级和"模型可见即已记录"这条不变量各自负责不同粒度的兼容性问题,不互相纠缠。
+这段话把"模型可见即已记录"从一句规范落实成了一个具体的默认值选择:遇到不认识的事件类型,读取器的默认行为是**拒绝**,而不是静默跳过。之所以默认拒绝而不是默认忽略,是因为这两种错误的代价完全不对称——多拒绝一次是"体验问题"(用户看到一条明确的报错,知道要升级 harness),而多忽略一次是"安全事故"(一个内容残缺的会话被静默地重建出来,用户完全不知道自己看到的历史是不完整的)。这也解释了为什么 `AGENTS.md` 里紧跟着这条规则的还有一句:"`SessionEventMap` members are required-on-read by default … only structural format changes bump `SESSION_FORMAT_VERSION`"——版本号只在结构性变更时才递增,普通新增事件靠 `ignorable` 标记吸收,版本升级和"模型可见即已记录"这条不变量各自负责不同粒度的兼容性问题,不互相纠缠。
 
 如果你在别处读到过这个项目里会话日志作为"重建模型历史的唯一权威来源"、fork/resume/遥测都是这份日志的投影这一整套事件溯源设计,那么"Model-visible ⟺ logged"这条规则,可以理解成是那套设计在 `AGENTS.md` 里被压缩成的一句可执行站规——它不重复讲机制本身是怎么实现的(这是 `docs/architecture.md` 和 `docs/subsystems/session.md` 的职责),只留下一句"新增模型可见输入,必须同时新增会话事件"的强制要求。
 
@@ -125,31 +125,31 @@
 > | Root `AGENTS.md` | Standing orders: rules an agent needs in context in every session, one to three lines each, linking its home | Stories, worked examples, situational procedures, anything restated from a linked home |
 > | [architecture.md](architecture.md) | Ordered map: composition, core packages, loop, seams, extension points; read before changing `packages/` | Type definitions (→ subsystems), per-package detail (→ package READMEs), decision rationale (→ Agent Notes), implementation-status annotations |
 > | [subsystems/](subsystems/README.md) | One reference page per subsystem: type definitions, semantics, and the generated Cordis API | Behavior narration (→ architecture.md) |
-> | [Agent Notes](../.agents/notes/README.md) | Active decision records: the why, what-was-given-up, and required verification | Migration plans, acceptance-task checklists, fixture walkthroughs, and spec-speak ("should…") once the decision has shipped |
+> | [Agent Notes](../.agents/notes/README.md) | Active decision records: the why, what-was-given-up, and required verification; `implemented/` notes describe shipped reality in present tense | Migration plans, acceptance-task checklists, fixture walkthroughs, and spec-speak ("should…") once the decision has shipped; archived notes are frozen history, never current authority |
 > | [postmortem/](postmortem/README.md) | Incident stories — the only tier where war-story narrative belongs | — |
-> | Package README | The per-package contract: config, semantics, limitations, extension points | JSDoc restatement, generated-catalog restatement (event/tool tables), other packages' concerns |
+> | Package README | The per-package contract: config, semantics, limitations, extension points, and Model Experience | JSDoc restatement, generated-catalog restatement (event/tool tables), other packages' concerns |
 >
 > —— `docs/AGENTS.md`
 
 这份分工可以这样理解:根 `AGENTS.md` 只放"每次会话都要带着走的规则",不放故事和案例(那是 postmortem 的职责);`architecture.md` 只放"改动 `packages/` 之前该知道的地图",不放类型定义的具体细节、也不放某个决定为什么这么做的取舍过程(那是 Agent Notes 的职责);Agent Notes 只记录"活跃的决策依据",一旦决策落地实现,就不该再保留"应该……"这种还没发生的语气;而 postmortem 是**整个文档体系里唯一被允许讲"事故叙事"的层级**——别的层级如果想复述一个 bug 的来龙去脉,规则会把它当作放错了地方。
 
-**`subsystems/` 这一档是相对课程写作时长得最明显的一层。** 当前的 `docs/subsystems/` 目录下已经有五十多个页面(`core.md`/`session.md`/`subagent.md`/`workflow.md`/`skills.md`/`sandbox.md` 等等,基本覆盖了本课程后续几篇要讲的每一个子系统),每个子系统一页,职责被限定得很窄——"类型定义、语义,以及一段自动生成的 Cordis API 参考",明确排除"行为叙事"(那属于 `architecture.md`)。这一层不是手写维护的:仓库里有 `verify-type-equiv` 这类脚本负责校验页面里粘贴的类型片段和源码没有漂移,配套的 Agent Note(`2026-08-03-package-anchored-subsystem-pages.md`)记录了"一个类型该挂在哪个子系统页面上"这条归属判定规则,页面里的"cordis-surface"区域则是自动从源码生成、不允许手改的。也就是说,`subsystems/` 从课程写作时一个还比较单薄的目录,长成了一整套有生成工具链、有归属规则、有校验守卫支撑的正式文档层级——这也是为什么第 07 篇能引用 `docs/subsystems/subagent.md`/`workflow.md`/`skills.md` 这类页面来核对具体的类型定义。
+**`subsystems/` 这一档是相对课程写作时长得最明显的一层。** 当前的 `docs/subsystems/` 目录下已经有六十多个页面(`core.md`/`session.md`/`subagent.md`/`workflow.md`/`skills.md`/`sandbox.md` 等等,基本覆盖了本课程后续几篇要讲的每一个子系统),每个子系统一页,职责被限定得很窄——"类型定义、语义,以及一段自动生成的 Cordis API 参考",明确排除"行为叙事"(那属于 `architecture.md`)。这一层不是手写维护的:仓库里有 `verify-type-equiv` 这类脚本负责校验页面里粘贴的类型片段和源码没有漂移,配套的 Agent Note(`2026-08-03-package-anchored-subsystem-pages.md`)记录了"一个类型该挂在哪个子系统页面上"这条归属判定规则,页面里的"cordis-surface"区域则是自动从源码生成、不允许手改的。也就是说,`subsystems/` 从课程写作时一个还比较单薄的目录,长成了一整套有生成工具链、有归属规则、有校验守卫支撑的正式文档层级——这也是为什么第 07 篇能引用 `docs/subsystems/subagent.md`/`workflow.md`/`skills.md` 这类页面来核对具体的类型定义。
 
 这套分工存在的直接理由,写在紧接着的"文档写作规则"一节里:
 
-> **Document current state, not change history.** Avoid "previously/now/no longer", PRs, commits, and stack positions in durable prose; name the live mechanism. Put change stories in commits, PRs, Agent Notes, or postmortems …
+> **Document current state.** Keep history in commits, PRs, Agent Notes, postmortems, or scoped persistence records. Other prose names live mechanisms, not changes or stack positions. …
 >
 > —— `docs/AGENTS.md`
 
 以及后面"slop checklist"(文档异味检查清单)里排第一位的:
 
-> The same rule stated in more than one home. Grep a distinctive phrase; keep one home and link the rest.
+> Duplicated rules: search a distinctive phrase; keep one home and link the rest.
 >
 > —— `docs/AGENTS.md`
 
-这两条合起来说明了"一个事实只有一个家"要防止的具体腐化过程:如果同一条规则、同一段机制说明可以随手写在两三个不同的文档里,这些副本会在后续迭代中各自被修改、各自遗漏更新,时间一长就会彼此矛盾——读者读到的到底是哪一份是权威的?这个问题在只有几个文档时不明显,但 DeepSeek Harness 的 `docs/` 目录有六十多项内容,还叠加了中英双语(`.md`/`.zh.md`/`.i18n.yaml` 三件套)的翻译负担,如果没有强制的"唯一归属"原则和一份可以直接 grep 关键短语去核查的检查清单,文档体系本身会比代码库更快陷入不可维护的重复与漂移。
+这两条合起来说明了"一个事实只有一个家"要防止的具体腐化过程:如果同一条规则、同一段机制说明可以随手写在两三个不同的文档里,这些副本会在后续迭代中各自被修改、各自遗漏更新,时间一长就会彼此矛盾——读者读到的到底是哪一份是权威的?这个问题在只有几个文档时不明显,但 DeepSeek Harness 的 `docs/` 目录有七十多项内容,还叠加了中英双语(`.md`/`.zh.md`/`.i18n.yaml` 三件套)的翻译负担,如果没有强制的"唯一归属"原则和一份可以直接 grep 关键短语去核查的检查清单,文档体系本身会比代码库更快陷入不可维护的重复与漂移。
 
-这套治理设计还配了一层机械执行:每一份"标准文档"都有一个字数预算上限(`pnpm run verify-doc-budgets` 强制,具体数字集中定义在 `scripts/doc-budgets.manifest.json` 这份清单里,而不是散落在各个文档正文里),当前根 `AGENTS.md` 的预算是 1950 词、`architecture.md` 是 2410 词(两个数字相对课程写作时都涨了不少,侧面说明这个项目本身还在持续变大)、大多数子树 `AGENTS.md` ≤ 600 词。字数预算和"一个事实只有一个家"其实是同一枚硬币的两面:如果一份文档的篇幅被硬性限制住,作者就没有空间去重复展开别处已经讲过的内容,唯一的出路就是把细节挪到它真正归属的那一层,自己这一层只留一条链接。当预算不够用时,`docs/AGENTS.md` 给出的优先顺序也很明确——先"迁移"内容到正确的层级,其次才是"压缩"表达,只有当内容确实需要更多篇幅时才"提高"预算上限,而且提高动作必须在 PR 里对预算清单的改动做出说明,不能悄悄改数字。
+这套治理设计还配了一层机械执行:每一份常备文档(standing doc)都有一个字数预算上限(`pnpm run verify-doc-budgets` 强制,具体数字集中定义在 `scripts/doc-budgets.manifest.json` 这份清单里,而不是散落在各个文档正文里),当前根 `AGENTS.md` 的预算是 1950 词、`architecture.md` 是 2410 词(两个数字相对课程写作时都涨了不少,侧面说明这个项目本身还在持续变大)、大多数子树 `AGENTS.md` ≤ 600 词。字数预算和"一个事实只有一个家"其实是同一枚硬币的两面:如果一份文档的篇幅被硬性限制住,作者就没有空间去重复展开别处已经讲过的内容,唯一的出路就是把细节挪到它真正归属的那一层,自己这一层只留一条链接。当预算不够用时,`docs/AGENTS.md` 给出的优先顺序也很明确——先"迁移"内容到正确的层级,其次才是"压缩"表达,只有当内容确实需要更多篇幅时才"提高"预算上限,而且提高动作必须在 PR 里对预算清单的改动做出说明,不能悄悄改数字。
 
 ## 常见问题/易踩坑
 
